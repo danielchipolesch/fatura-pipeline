@@ -1,0 +1,44 @@
+# === Dados de faturas (entrada e saída) ===
+# PDFs de faturas reais não devem ir para o repositório — são dados da
+# instituição, não código. Mantém a pasta no repo via .gitkeep.
+input/*
+!input/.gitkeep
+
+# JSONs padronizados gerados pelo pipeline, registro de idempotência e
+# dumps de texto de depuração.
+output/*
+!output/.gitkeep
+
+# === Logs ===
+logs/*.log
+logs/*
+!logs/.gitkeep
+
+# === Configuração local ===
+# .env contém configuração específica da máquina (URLs, modelo do Ollama,
+# thresholds) — cada ambiente (dev, produção on-premises) tem o seu.
+# .env.example permanece versionado como referência.
+.env
+.env.local
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# === Docker ===
+# Modelos do docling/Ollama ficam em volumes Docker nomeados, nunca no
+# diretório do projeto — não há artefato de runtime do Docker a ignorar aqui
+# além dos já listados acima.
+
+# === Editores / SO ===
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,57 @@
+services:
+  # ---------------------------------------------------------------------------
+  # Serviço principal: extração de faturas
+  # ---------------------------------------------------------------------------
+  fatura-pipeline:
+    build: .
+    container_name: fatura_pipeline
+    volumes:
+      - ./input:/app/input
+      - ./output:/app/output
+      - ./logs:/app/logs
+      - docling_models:/root/.cache/docling
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CUDA_VISIBLE_DEVICES=
+      - OMP_NUM_THREADS=4
+      # URL interna do Ollama (nome do serviço Docker resolve automaticamente)
+      - LLM_BASE_URL=http://ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Ollama: servidor de LLM open source (fallback de exceção)
+  # Modelos ficam em volume persistente — não são rebaixados a cada restart.
+  # Download do modelo ocorre automaticamente na primeira chamada ao LLM fallback.
+  #
+  # Modelos recomendados para CPU (configurar LLM_MODEL no .env):
+  #   qwen2.5:3b    — Apache 2.0, multilingual, ~2 GB, default
+  #   llama3.2:3b   — Meta Community License, ~2 GB
+  #   mistral:7b    — Apache 2.0, mais capaz, ~4 GB, mais lento em CPU
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      # Expõe a API do Ollama para uso externo (ex: testar via curl/Postman)
+      - "11434:11434"
+    environment:
+      - OLLAMA_NUM_PARALLEL=1   # CPU: sem paralelismo para não sobrecarregar
+      - OLLAMA_MAX_LOADED_MODELS=1
+    healthcheck:
+      test: ["CMD", "ollama", "ls"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  docling_models:
+  ollama_models:
