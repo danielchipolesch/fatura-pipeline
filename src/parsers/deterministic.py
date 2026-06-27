@@ -29,18 +29,25 @@ from src.extractors.fields import (
     extract_br_state,
     extract_cnpj,
     extract_cnpj_after_label,
+    extract_client_number,
+    extract_consumer_unit,
+    extract_consumption_kwh,
     extract_cpf,
     extract_currency,
     extract_date,
     extract_date_before_currency,
+    extract_demand_overage_value,
     extract_email,
     extract_labeled_value,
     extract_lines_after_label,
+    extract_measured_demand_kw,
     extract_number_after_hex_signature,
     extract_phone,
+    extract_reactive_excess,
     format_cnpj_digits,
     has_hex_signature,
     parse_currency,
+    parse_currency_or_flag,
     strip_label_prefix,
 )
 from src.extractors.known_entities import (
@@ -51,11 +58,13 @@ from src.extractors.known_entities import (
 )
 from src.models.invoice import (
     Address,
+    EnergyMetrics,
     Invoice,
     InvoiceLayout,
     LineItem,
     Party,
     ParsingMethod,
+    READ_ERROR_SENTINEL,
     Tax,
 )
 from src.parsers.docling_loader import DocumentContent
@@ -340,19 +349,27 @@ class _FieldExtractor:
     }
 
     @classmethod
-    def total_via_labels(cls, text: str, layout: InvoiceLayout) -> Optional[float]:
-        """Busca o total somente via rótulos conhecidos — sem heurística de fallback."""
+    def total_via_labels(cls, text: str, layout: InvoiceLayout) -> float | str | None:
+        """
+        Busca o total somente via rótulos conhecidos — sem heurística de
+        fallback. Se algum rótulo for encontrado mas nenhum valor capturado
+        puder ser convertido em número válido, retorna READ_ERROR_SENTINEL
+        em vez de None — sinaliza que HÁ um total na fatura, mas a extração
+        falhou (diferente de nenhum rótulo ter sido encontrado).
+        """
         labels = cls._TOTAL_LABELS_BY_LAYOUT.get(layout, cls._TOTAL_LABELS_BY_LAYOUT[InvoiceLayout.GENERIC])
+        label_matched_unparseable = False
         for label in labels:
-            val = extract_labeled_value(text, label, r"R?\$?\s*[\d.,]+")
+            val = extract_labeled_value(text, label, r"R?\$?\s*[\d.,\-]+")
             if val:
                 v = parse_currency(val)
                 if v is not None and v > 0:
                     return v
-        return None
+                label_matched_unparseable = True
+        return READ_ERROR_SENTINEL if label_matched_unparseable else None
 
     @staticmethod
-    def total(text: str, layout: InvoiceLayout) -> Optional[float]:
+    def total(text: str, layout: InvoiceLayout) -> float | str | None:
         """
         Busca o total via rótulos e, na ausência destes, usa o maior valor
         monetário do documento como último recurso.
@@ -366,45 +383,115 @@ class _FieldExtractor:
         """
         labeled = _FieldExtractor.total_via_labels(text, layout)
         if labeled is not None:
-            return labeled
+            return labeled  # float ou READ_ERROR_SENTINEL
 
         values = extract_all_currencies(text)
         return max(values) if values else None
 
     @staticmethod
-    def subtotal(text: str) -> Optional[float]:
+    def subtotal(text: str) -> float | str | None:
         label_patterns = [
             r"Subtotal",
             r"VALOR\s+(?:DOS\s+)?PRODUTOS",
             r"VALOR\s+(?:DOS\s+)?SERVI[ÇC]OS",
             r"Base\s+de\s+C[áa]lculo",
         ]
+        label_matched_unparseable = False
         for label in label_patterns:
-            val = extract_labeled_value(text, label, r"R?\$?\s*[\d.,]+")
+            val = extract_labeled_value(text, label, r"R?\$?\s*[\d.,\-]+")
             if val:
                 v = parse_currency(val)
                 if v is not None and v > 0:
                     return v
-        return None
+                label_matched_unparseable = True
+        return READ_ERROR_SENTINEL if label_matched_unparseable else None
 
     # -- Impostos --
 
     @staticmethod
     def taxes(text: str, layout: InvoiceLayout) -> list[Tax]:
+        """
+        Extrai impostos do texto. Cada imposto pode ter mais de um padrão,
+        tentados em ordem do mais específico para o mais genérico — documentos
+        diferentes (ou seções diferentes da mesma fatura) usam estruturas bem
+        distintas para o mesmo tributo:
+          - "TRIBUTO\\nBASE\\nALÍQUOTA%\\nVALOR" — tabela de 3 números em
+            sequência (comum em faturas Enel SP). Tentada PRIMEIRO porque,
+            sendo mais específica, evita o risco de capturar a base de
+            cálculo como se fosse o valor do imposto (ver abaixo).
+          - "Valor do ICMS: R$ X" — estrutura padrão de DANFE, um só número.
+          - "CSLL (1,00%): R$49.00" — estrutura de "impostos retidos" anotada
+            separadamente do cálculo principal (formato do valor pode vir em
+            notação americana, "49.00"; parse_currency já trata isso).
+
+        Cuidado: SEM a tentativa da estrutura de tabela primeiro, o padrão
+        simples capturaria erroneamente a BASE DE CÁLCULO em vez do VALOR do
+        imposto nesses casos (ex.: "ICMS\\n36.324,77\\n18,00\\n6.538,43" —
+        o padrão simples pegaria 36.324,77, mas o valor real do ICMS é
+        6.538,43). A estrutura de tabela usa os 3 números corretamente como
+        base/alíquota/valor.
+
+        Quando um rótulo é encontrado mas o valor capturado não pode ser
+        convertido em número, o campo correspondente recebe
+        READ_ERROR_SENTINEL em vez de ser descartado silenciosamente —
+        sinaliza que HÁ um dado na fatura, mas a extração falhou.
+        """
         result: list[Tax] = []
-        tax_defs: list[tuple[str, str]] = [
-            ("ICMS", r"(?:Valor\s+do\s+)?ICMS\s*[:\s]+R?\$?\s*([\d.,]+)"),
-            ("IPI", r"(?:Valor\s+do\s+)?IPI\s*[:\s]+R?\$?\s*([\d.,]+)"),
-            ("ISS", r"(?:Valor\s+do\s+)?ISS(?:QN)?\s*[:\s]+R?\$?\s*([\d.,]+)"),
-            ("PIS", r"(?:Valor\s+do\s+)?PIS\s*[:\s]+R?\$?\s*([\d.,]+)"),
-            ("COFINS", r"(?:Valor\s+da?\s+)?COFINS\s*[:\s]+R?\$?\s*([\d.,]+)"),
+        # name -> lista de (regex, número_de_grupos: 1=só valor, 3=base/aliquota/valor)
+        tax_defs: list[tuple[str, list[tuple[str, int]]]] = [
+            ("ICMS", [
+                (r"\bICMS\s*\n?\s*([\d.,\-]+)\s*\n?\s*([\d.,\-]+)\s*\n?\s*([\d.,\-]+)", 3),
+                (r"(?:Valor\s+do\s+)?ICMS\s*[:\s]+R?\$?\s*([\d.,\-]+)", 1),
+            ]),
+            ("IPI", [
+                (r"(?:Valor\s+do\s+)?IPI\s*[:\s]+R?\$?\s*([\d.,\-]+)", 1),
+            ]),
+            ("ISS", [
+                (r"(?:Valor\s+do\s+)?ISS(?:QN)?\s*[:\s]+R?\$?\s*([\d.,\-]+)", 1),
+            ]),
+            ("PIS", [
+                (r"PIS(?:/PASEP)?\s*\n?\s*([\d.,\-]+)\s*\n?\s*([\d.,\-]+)\s*\n?\s*([\d.,\-]+)", 3),
+                (r"PIS(?:/PASEP)?\s*\([\d.,]+\s*%\)\s*:\s*R\$\s*([\d.,\-]+)", 1),
+                (r"(?:Valor\s+do\s+)?PIS(?:/PASEP)?\s*[:\s]+R?\$?\s*([\d.,\-]+)", 1),
+            ]),
+            ("COFINS", [
+                (r"COFINS\s*\n?\s*([\d.,\-]+)\s*\n?\s*([\d.,\-]+)\s*\n?\s*([\d.,\-]+)", 3),
+                (r"COFINS\s*\([\d.,]+\s*%\)\s*:\s*R\$\s*([\d.,\-]+)", 1),
+                (r"(?:Valor\s+da?\s+)?COFINS\s*[:\s]+R?\$?\s*([\d.,\-]+)", 1),
+            ]),
+            ("CSLL", [
+                (r"CSLL\s*\([\d.,]+\s*%\)\s*:\s*R\$\s*([\d.,\-]+)", 1),
+                (r"(?:Valor\s+da?\s+)?CSLL\s*[:\s]+R?\$?\s*([\d.,\-]+)", 1),
+            ]),
+            ("IRPJ", [
+                (r"IRPJ\s*\([\d.,]+\s*%\)\s*:\s*R\$\s*([\d.,\-]+)", 1),
+                (r"(?:Valor\s+do\s+)?IRPJ\s*[:\s]+R?\$?\s*([\d.,\-]+)", 1),
+            ]),
         ]
-        for name, pattern in tax_defs:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m:
-                amount = parse_currency(m.group(1))
-                if amount is not None and amount >= 0:
-                    result.append(Tax(name=name, amount=amount))
+        for name, patterns in tax_defs:
+            tax: Optional[Tax] = None
+            for pattern, n_groups in patterns:
+                m = re.search(pattern, text, re.IGNORECASE)
+                if not m:
+                    continue
+                if n_groups == 3:
+                    tax = Tax(
+                        name=name,
+                        base=parse_currency_or_flag(m.group(1)),
+                        rate=parse_currency_or_flag(m.group(2)),
+                        amount=parse_currency_or_flag(m.group(3)),
+                    )
+                else:
+                    tax = Tax(name=name, amount=parse_currency_or_flag(m.group(1)))
+                break
+            if tax is None:
+                continue
+            # Imposto com valor negativo é sinal de que o rótulo provavelmente
+            # capturou a linha errada (impostos não são negativos por
+            # natureza) — sinaliza para revisão em vez de reportar confuso.
+            if isinstance(tax.amount, float) and tax.amount < 0:
+                tax.amount = READ_ERROR_SENTINEL
+            result.append(tax)
         return result
 
 
@@ -666,6 +753,28 @@ class DeterministicParser:
                 if known_name:
                     customer.name = known_name
 
+        # -- Métricas de energia para BI (apenas faturas de energia elétrica) --
+        # Extração puramente direta: nenhum valor aqui é calculado a partir de
+        # outro campo. Quando o dado não está impresso na fatura (ex: fator de
+        # potência), o campo correspondente fica null — ausência confirmada,
+        # não falha de extração. Ver EnergyMetrics para detalhes de cada campo.
+        energy = EnergyMetrics(
+            consumer_unit=extract_consumer_unit(text),
+            client_number=extract_client_number(text),
+            measured_demand_offpeak_kw=extract_measured_demand_kw(text),
+            demand_overage_value=extract_demand_overage_value(text),
+        )
+        energy.consumption_peak_kwh, energy.consumption_offpeak_kwh = extract_consumption_kwh(text)
+        reactive = extract_reactive_excess(text)
+        energy.reactive_energy_excess_peak_kwh = reactive["peak_kwh"]
+        energy.reactive_energy_excess_offpeak_kwh = reactive["offpeak_kwh"]
+        energy.reactive_penalty_peak_value = reactive["peak_value"]
+        energy.reactive_penalty_offpeak_value = reactive["offpeak_value"]
+        # measured_demand_peak_kw e power_factor_measured permanecem null:
+        # não há rótulo confirmado para esses campos em nenhum layout mapeado
+        # até agora (faturas Azul trariam demanda ponta separadamente; fator
+        # de potência não aparece impresso em nenhuma amostra analisada).
+
         invoice = Invoice(
             invoice_number=invoice_number,
             invoice_layout=layout,
@@ -677,6 +786,7 @@ class DeterministicParser:
             customer=customer or Party(),
             line_items=line_items,
             taxes=taxes,
+            energy=energy,
             subtotal=subtotal,
             total=total,
             bank_slip_barcode=barcode,
@@ -722,7 +832,10 @@ def calculate_confidence(invoice: Invoice) -> float:
         score += _WEIGHTS["customer_name"]
     if invoice.customer and (invoice.customer.cnpj or invoice.customer.cpf):
         score += _WEIGHTS["customer_cnpj"]
-    if invoice.total and invoice.total > 0:
+    # invoice.total pode ser a sentinela READ_ERROR_SENTINEL (string) em vez
+    # de número — nesse caso não conta para o score (não temos um valor
+    # numérico válido), mas não deve quebrar a comparação.
+    if isinstance(invoice.total, (int, float)) and invoice.total > 0:
         score += _WEIGHTS["total"]
     if invoice.line_items:
         score += _WEIGHTS["line_items"]
@@ -743,6 +856,6 @@ def get_missing_required_fields(invoice: Invoice) -> list[str]:
         missing.append("supplier_name — nome/razão social do emitente ou fornecedor")
     if not invoice.supplier or not (invoice.supplier.cnpj or invoice.supplier.cpf):
         missing.append("supplier_cnpj — CNPJ ou CPF do emitente")
-    if not invoice.total or invoice.total <= 0:
+    if not isinstance(invoice.total, (int, float)) or invoice.total <= 0:
         missing.append("total — valor total da fatura (número decimal, ex: 1234.56)")
     return missing

@@ -2,9 +2,23 @@ from __future__ import annotations
 
 from datetime import date
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
+
+# Sentinela usada em campos numéricos para distinguir duas situações que
+# `null` por si só não consegue diferenciar:
+#   - valor null: o dado simplesmente não consta na fatura (ausência real)
+#   - valor READ_ERROR_SENTINEL: HÁ um valor impresso na fatura para esse
+#     campo, mas o parser determinístico não conseguiu interpretá-lo (ex:
+#     formato numérico inesperado, rótulo capturou texto não numérico). É
+#     um sinal de que o padrão de extração precisa ser refinado — diferente
+#     de uma ausência legítima.
+READ_ERROR_SENTINEL = "LEITURA_FALHOU"
+
+# Tipo usado pelos campos numéricos sujeitos a essa distinção: número (lido
+# com sucesso), None (ausente) ou READ_ERROR_SENTINEL (presente, mas ilegível).
+NumericValue = Union[float, str, None]
 
 
 class InvoiceLayout(str, Enum):
@@ -51,18 +65,55 @@ class LineItem(BaseModel):
     ncm: Optional[str] = None    # Código NCM (NF-e)
     cfop: Optional[str] = None   # CFOP (NF-e)
     unit: Optional[str] = None
-    quantity: Optional[float] = None
-    unit_price: Optional[float] = None
-    discount: Optional[float] = None
-    tax_rate: Optional[float] = None
-    total: Optional[float] = None
+    quantity: NumericValue = None
+    unit_price: NumericValue = None
+    discount: NumericValue = None
+    tax_rate: NumericValue = None
+    total: NumericValue = None
 
 
 class Tax(BaseModel):
     name: str                    # ICMS, ISS, IPI, PIS, COFINS, etc.
-    base: Optional[float] = None
-    rate: Optional[float] = None
-    amount: Optional[float] = None
+    base: NumericValue = None
+    rate: NumericValue = None
+    amount: NumericValue = None
+
+
+class EnergyMetrics(BaseModel):
+    """
+    Métricas técnicas específicas de faturas de energia elétrica, relevantes
+    para BI e gestão de mercado de energia (cativo/livre). Todo campo aqui é
+    extraído diretamente do texto da fatura — NUNCA calculado a partir de
+    outros campos. Quando o dado não está impresso no documento (ex: fator
+    de potência, ausente em todos os layouts mapeados até o momento), o
+    campo permanece null — isso é informação válida (ausência confirmada),
+    não uma falha de extração.
+
+    Demanda medida: faturas em tarifa Horosazonal Verde têm um único valor
+    de demanda (sem distinção ponta/fora-ponta — convencionalmente chamado
+    "fora ponta" pelo padrão ANEEL/CEMIG/Enel). Faturas em tarifa Azul
+    trariam ambos os valores separadamente, mas nenhuma amostra analisada
+    até agora usa essa modalidade.
+
+    consumer_unit vs client_number: são identificadores DIFERENTES e não
+    devem ser confundidos. A Unidade Consumidora (UC) identifica o ponto de
+    conexão/instalação física (rótulos: "UC", "Nº DA INSTALAÇÃO",
+    "UNID. CONSUMIDORA"). O Número do Cliente identifica a conta/contrato
+    do cliente junto à concessionária (rótulo: "Nº DO CLIENTE") — um mesmo
+    cliente pode ter várias UCs, e vice-versa em alguns arranjos.
+    """
+    consumer_unit: Optional[str] = None  # Unidade Consumidora (UC) / Nº da Instalação
+    client_number: Optional[str] = None  # Número do Cliente junto à concessionária (≠ UC)
+    consumption_peak_kwh: NumericValue = None        # Consumo ativo medido na ponta (kWh)
+    consumption_offpeak_kwh: NumericValue = None      # Consumo ativo medido fora de ponta (kWh)
+    measured_demand_peak_kw: NumericValue = None      # Demanda medida na ponta (kW) — tarifa Azul
+    measured_demand_offpeak_kw: NumericValue = None   # Demanda medida fora de ponta / única (kW)
+    power_factor_measured: NumericValue = None        # Fator de potência medido
+    reactive_energy_excess_peak_kwh: NumericValue = None     # UFER ponta (kWh)
+    reactive_energy_excess_offpeak_kwh: NumericValue = None  # UFER fora de ponta (kWh)
+    demand_overage_value: NumericValue = None         # Valor (R$) de ultrapassagem de demanda contratada
+    reactive_penalty_peak_value: NumericValue = None      # Valor (R$) da multa reativa (UFER) na ponta
+    reactive_penalty_offpeak_value: NumericValue = None   # Valor (R$) da multa reativa (UFER) fora de ponta
 
 
 class Invoice(BaseModel):
@@ -77,6 +128,13 @@ class Invoice(BaseModel):
     com valor null — nunca é omitida. Isso garante que qualquer sistema
     consumidor possa depender de uma estrutura estável, sem precisar tratar
     chaves ausentes.
+
+    Campos numéricos (ver NumericValue) distinguem dois tipos de "sem valor":
+      - null: o dado não consta na fatura (ausência confirmada).
+      - "LEITURA_FALHOU" (READ_ERROR_SENTINEL): HÁ um valor impresso na
+        fatura para esse campo, mas o parser não conseguiu interpretá-lo —
+        sinaliza que o padrão de extração precisa de ajuste, sem se
+        confundir com uma ausência real.
     """
 
     # Identificação
@@ -99,11 +157,15 @@ class Invoice(BaseModel):
     line_items: List[LineItem] = Field(default_factory=list)
     taxes: List[Tax] = Field(default_factory=list)
 
+    # Métricas de energia para BI — sempre um objeto (nunca None), mesmo
+    # princípio do Address/Party acima.
+    energy: EnergyMetrics = Field(default_factory=EnergyMetrics)
+
     # Totais
-    subtotal: Optional[float] = None
-    discount: Optional[float] = None
-    total_taxes: Optional[float] = None
-    total: Optional[float] = None
+    subtotal: NumericValue = None
+    discount: NumericValue = None
+    total_taxes: NumericValue = None
+    total: NumericValue = None
     currency: str = "BRL"
 
     # Pagamento

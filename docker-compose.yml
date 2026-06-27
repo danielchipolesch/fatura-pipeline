@@ -18,9 +18,9 @@ services:
       - OMP_NUM_THREADS=4
       # URL interna do Ollama (nome do serviço Docker resolve automaticamente)
       - LLM_BASE_URL=http://ollama:11434
-      - HTTP_PROXY=http://${PROXY_USER}:${PROXY_PASSWORD}@${PROXY_HOST}:${PROXY_PORT}
-      - HTTPS_PROXY=http://${PROXY_USER}:${PROXY_PASSWORD}@${PROXY_HOST}:${PROXY_PORT}
-      - NO_PROXY=localhost,127.0.0.1,ollama
+      # - HTTP_PROXY=http://${PROXY_USER}:${PROXY_PASSWORD}@${PROXY_HOST}:${PROXY_PORT}
+      # - HTTPS_PROXY=http://${PROXY_USER}:${PROXY_PASSWORD}@${PROXY_HOST}:${PROXY_PORT}
+      # - NO_PROXY=localhost,127.0.0.1,ollama
     depends_on:
       ollama:
         condition: service_healthy

@@ -8,6 +8,8 @@ import re
 from datetime import date
 from typing import Optional
 
+from src.models.invoice import READ_ERROR_SENTINEL
+
 # ---------------------------------------------------------------------------
 # Padrões compilados
 # ---------------------------------------------------------------------------
@@ -312,29 +314,84 @@ def extract_all_dates(text: str) -> list[date]:
 
 
 def parse_currency(value_str: str) -> Optional[float]:
-    """Converte string monetária brasileira em float (ex: '1.234,56' → 1234.56)."""
+    """
+    Converte string numérica brasileira (ou americana) em float
+    (ex: '1.234,56' → 1234.56; '49.00' → 49.0).
+
+    Apesar do nome (mantido por compatibilidade — usado em todo o código para
+    valores em R$), também é usado para quantidades técnicas com precisão
+    diferente de 2 casas decimais (ex: kWh com 3 casas: '1.294,839'). Por
+    isso aceita qualquer número de dígitos após o separador decimal, não
+    apenas 2 — uma fatura de energia frequentemente mistura valores
+    monetários (2 casas) e quantidades de consumo/demanda (3+ casas) nas
+    mesmas tabelas de itens.
+
+    Detecta automaticamente formato BR (1.234,56) e americano/US (1,234.56
+    ou 49.00) — algumas faturas usam um formato em uma seção e outro em
+    outra (ex: anotações de retenção de impostos em formato americano numa
+    DANFE cujo restante do documento usa formato BR).
+
+    Trata sinal de menos tanto no início ("-1.234,56") quanto no fim
+    ("1.234,56-"), comum em linhas de dedução/retenção em faturas de energia.
+    """
     s = value_str.strip().replace("R$", "").replace(" ", "")
 
-    # Formato BR: pontos como milhar, vírgula como decimal  →  1.234,56
-    if re.match(r"^\d{1,3}(\.\d{3})*,\d{2}$", s):
-        return float(s.replace(".", "").replace(",", "."))
+    negative = False
+    if s.startswith("-"):
+        negative = True
+        s = s[1:]
+    elif s.endswith("-"):
+        negative = True
+        s = s[:-1]
 
-    # Formato US: vírgulas como milhar, ponto como decimal  →  1,234.56
-    if re.match(r"^\d{1,3}(,\d{3})*\.\d{2}$", s):
-        return float(s.replace(",", ""))
+    value: Optional[float] = None
 
-    # Somente vírgula (sem milhar): 1234,56
-    if "," in s and "." not in s:
+    # Formato BR: pontos como milhar, vírgula como decimal (qualquer nº de
+    # casas)  →  1.234,56  ou  1.294,839
+    if re.match(r"^\d{1,3}(\.\d{3})*,\d+$", s):
+        value = float(s.replace(".", "").replace(",", "."))
+
+    # Formato US: vírgulas como milhar, ponto como decimal  →  1,234.56 ou 49.00
+    elif re.match(r"^\d{1,3}(,\d{3})*\.\d+$", s):
+        value = float(s.replace(",", ""))
+
+    # Somente vírgula (sem milhar): 1234,56 ou 1234,839
+    elif "," in s and "." not in s:
         try:
-            return float(s.replace(",", "."))
+            value = float(s.replace(",", "."))
         except ValueError:
-            pass
+            value = None
 
-    # Somente ponto: 1234.56
-    try:
-        return float(s)
-    except ValueError:
+    # Somente ponto ou inteiro puro: 1234.56 / 1234
+    else:
+        try:
+            value = float(s)
+        except ValueError:
+            value = None
+
+    if value is None:
         return None
+    return -value if negative else value
+
+
+def parse_currency_or_flag(raw: Optional[str]) -> float | str | None:
+    """
+    Converte string numérica em float, distinguindo ausência de erro de leitura:
+      - raw is None (nenhum trecho casou com o padrão de extração) → None
+        (ausência genuína — o dado não está na fatura)
+      - raw não é None, mas parse_currency() não conseguiu convertê-lo em
+        número válido → READ_ERROR_SENTINEL (HÁ um valor impresso na fatura
+        para esse campo, mas o parser não conseguiu interpretá-lo)
+      - raw é convertível → o float correspondente
+
+    Use esta função (em vez de parse_currency) nos pontos de extração onde
+    já se confirmou que um rótulo/âncora foi encontrado no texto — ali a
+    diferença entre "ausente" e "ilegível" é significativa.
+    """
+    if raw is None:
+        return None
+    value = parse_currency(raw)
+    return value if value is not None else READ_ERROR_SENTINEL
 
 
 def extract_currency(text: str) -> Optional[float]:
@@ -432,3 +489,165 @@ def strip_label_prefix(name: str, label_patterns: list[str]) -> str:
     for p in label_patterns:
         name = re.sub(rf"^{p}\s*", "", name, flags=re.IGNORECASE).strip()
     return name
+
+
+# ---------------------------------------------------------------------------
+# Métricas de energia elétrica (BI) — extração direta, nunca calculada
+# ---------------------------------------------------------------------------
+
+def extract_consumer_unit(text: str) -> Optional[str]:
+    """
+    Extrai o código da Unidade Consumidora (UC) — identifica o ponto de
+    conexão/instalação física. NÃO deve ser confundido com o "Número do
+    Cliente" (identifica a conta/contrato junto à concessionária — ver
+    extract_client_number). Tenta, em ordem de confiabilidade:
+      1. "UC <código>" (ex: Amazonas Energia)
+      2. "Nº DO CLIENTE ... Nº DA INSTALAÇÃO <cliente> <instalação>" (CEMIG)
+         — captura especificamente o valor da INSTALAÇÃO, não do cliente
+      3. "INSTALAÇÃO <código>" ou "UNID. CONSUMIDORA <código>" isolados
+    """
+    m = re.search(r"\bUC\s+([\d][\d.\-]*)", text)
+    if m:
+        return m.group(1).strip()
+
+    m = re.search(
+        r"N[ºo°]\s*D[OA]\s*CLIENTE\s*\n?\s*N[ºo°]?\s*\n?\s*DA\s*\n?\s*"
+        r"INSTALA[ÇC][ÃA]O\s*\n?\s*\d+\s*\n?\s*(\d+)",
+        text, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+
+    m = re.search(
+        r"(?:N[ºo°]\s*(?:DA\s*)?)?INSTALA[ÇC][ÃA]O\s*[:\s]*\n?\s*(\d{4,})",
+        text, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+
+    m = re.search(
+        r"UNID(?:ADE)?\.?\s*CONSUMIDORA\s*[:\s]*\n?\s*(\d{4,})",
+        text, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+
+    return None
+
+
+def extract_client_number(text: str) -> Optional[str]:
+    """
+    Extrai o "Número do Cliente" — identifica a conta/contrato do cliente
+    junto à concessionária. É um identificador DIFERENTE da Unidade
+    Consumidora (UC/Instalação — ver extract_consumer_unit): um mesmo
+    cliente pode ter várias UCs associadas à mesma conta.
+    """
+    m = re.search(r"N[ºo°]\s+do\s+cliente\s*:?\s*\n?\s*(\d+)", text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    # CEMIG: "Nº DO CLIENTE ... Nº DA INSTALAÇÃO <cliente> <instalação>"
+    # — aqui queremos especificamente o primeiro valor (cliente).
+    m = re.search(
+        r"N[ºo°]\s*D[OA]\s*CLIENTE\s*\n?\s*N[ºo°]?\s*\n?\s*DA\s*\n?\s*"
+        r"INSTALA[ÇC][ÃA]O\s*\n?\s*(\d+)",
+        text, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+
+    return None
+
+
+def extract_consumption_kwh(text: str) -> tuple[float | str | None, float | str | None]:
+    """
+    Extrai consumo ativo medido (kWh), a partir dos itens de fatura
+    "CONSUMO ATIVO PONTA" e "CONSUMO ATIVO F. PONTA" (TE ou TUSD — mesma
+    quantidade, são apenas componentes tarifários diferentes sobre o mesmo
+    consumo). Retorna (consumo_ponta_kwh, consumo_fora_ponta_kwh) — cada um
+    None (rótulo não encontrado) ou READ_ERROR_SENTINEL (rótulo encontrado,
+    valor ilegível) quando aplicável.
+    """
+    peak = None
+    m = re.search(
+        r"CONSUMO\s+ATIVO\s+PONTA\s+(?:TE|TUSD)\s*\n?\s*KWH\s*\n?\s*([\d.,]+)",
+        text, re.IGNORECASE,
+    )
+    if m:
+        peak = parse_currency_or_flag(m.group(1))
+
+    offpeak = None
+    m = re.search(
+        r"CONSUMO\s+ATIVO\s+F\.?\s*PONTA\s+(?:TE|TUSD)\s*\n?\s*KWH\s*\n?\s*([\d.,]+)",
+        text, re.IGNORECASE,
+    )
+    if m:
+        offpeak = parse_currency_or_flag(m.group(1))
+
+    return peak, offpeak
+
+
+def extract_measured_demand_kw(text: str) -> float | str | None:
+    """
+    Extrai a demanda medida (kW) a partir do item de fatura "DEMANDA" —
+    exige que a linha seja exatamente "DEMANDA" (não "ULTRAPASSAGEM DEMANDA"
+    nem outras variantes), para evitar capturar a quantidade de ultrapassagem
+    em vez da demanda medida.
+
+    Em tarifa Horosazonal Verde existe um único valor de demanda (sem
+    distinção ponta/fora-ponta); ver EnergyMetrics para detalhes.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().upper() != "DEMANDA":
+            continue
+        for j in range(i + 1, min(i + 4, len(lines))):
+            if lines[j].strip().upper() == "KW" and j + 1 < len(lines):
+                return parse_currency_or_flag(lines[j + 1].strip())
+    return None
+
+
+def extract_demand_overage_value(text: str) -> float | str | None:
+    """
+    Extrai o valor (R$) do item de fatura "ULTRAPASSAGEM DEMANDA" — a
+    penalidade por exceder a demanda contratada. Estrutura do item:
+    "ULTRAPASSAGEM DEMANDA / KW / <quant> / <preço unit> / <valor R$> / ...".
+    """
+    m = re.search(
+        r"ULTRAPASSAGEM\s+DEMANDA\s*\n?\s*KW\s*\n?\s*[\d.,]+\s*\n?\s*[\d.,]+\s*\n?\s*([\d.,]+)",
+        text, re.IGNORECASE,
+    )
+    return parse_currency_or_flag(m.group(1)) if m else None
+
+
+def extract_reactive_excess(text: str) -> dict[str, float | str | None]:
+    """
+    Extrai energia reativa excedente (UFER — Unidade para Faturamento de
+    Energia Reativa) e o respectivo valor (R$) da multa por baixo fator de
+    potência, separados por ponta/fora-ponta. Estrutura do item:
+    "UFER PONTA TE / KWH / <quant kWh> / <preço unit> / <valor R$> / ...".
+
+    Retorna um dict com as chaves: peak_kwh, offpeak_kwh, peak_value, offpeak_value.
+    """
+    result: dict[str, float | str | None] = {
+        "peak_kwh": None, "offpeak_kwh": None,
+        "peak_value": None, "offpeak_value": None,
+    }
+
+    m = re.search(
+        r"UFER\s+PONTA\s+TE\s*\n?\s*KWH\s*\n?\s*([\d.,]+)\s*\n?\s*[\d.,]+\s*\n?\s*([\d.,]+)",
+        text, re.IGNORECASE,
+    )
+    if m:
+        result["peak_kwh"] = parse_currency_or_flag(m.group(1))
+        result["peak_value"] = parse_currency_or_flag(m.group(2))
+
+    m = re.search(
+        r"UFER\s+FORA\s+PONTA\s+TE\s*\n?\s*KWH\s*\n?\s*([\d.,]+)\s*\n?\s*[\d.,]+\s*\n?\s*([\d.,]+)",
+        text, re.IGNORECASE,
+    )
+    if m:
+        result["offpeak_kwh"] = parse_currency_or_flag(m.group(1))
+        result["offpeak_value"] = parse_currency_or_flag(m.group(2))
+
+    return result
