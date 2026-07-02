@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from enum import Enum
-from typing import List, Optional, Union
+from typing import ClassVar, List, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -29,10 +29,34 @@ class InvoiceLayout(str, Enum):
     GENERIC = "generic"  # Fatura genérica / outros formatos
 
 
+class TipoFaturaOperacional(str, Enum):
+    """
+    Tipo operacional da fatura de energia elétrica — derivado por inferência,
+    não lido diretamente do documento.
+
+    Importa para o dashboard porque uma UC em Mercado Livre gera DUAS faturas
+    por competência (distribuidora + comercializadora). Somar ambas como
+    "despesa" duplicaria o custo. O dashboard usa este campo para consolidar
+    corretamente por UC/competência, sem dupla contagem nem subestimação.
+
+      CATIVO             — Mercado cativo: fatura única, TE + TUSD juntos,
+                           emitida pela concessionária/distribuidora local.
+      DISTRIBUIDORA_MLE  — Mercado Livre, fatura da distribuidora: cobra apenas
+                           uso da rede (TUSD); energia adquirida da comercializadora
+                           aparece como abatimento/dedução ("Energia Terc.
+                           Comercializada" ou "Energia ACL").
+      COMERCIALIZADORA_MLE — Mercado Livre, fatura da comercializadora: cobra
+                           apenas energia (TE) em MWh, sem TUSD nem demanda.
+    """
+    CATIVO               = "CATIVO"
+    DISTRIBUIDORA_MLE    = "DISTRIBUIDORA_MLE"
+    COMERCIALIZADORA_MLE = "COMERCIALIZADORA_MLE"
+
+
 class ParsingMethod(str, Enum):
-    DETERMINISTIC = "deterministic"
-    LLM_FALLBACK = "llm_fallback"
-    HYBRID = "hybrid"  # Determinístico + complementado pelo LLM
+    SEMANTIC = "semantic"         # DoclingExtractor (estrutura nativa) como fonte principal, sem LLM
+    DETERMINISTIC = "deterministic"  # Regex (DeterministicParser) como fonte principal, sem LLM
+    HYBRID = "hybrid"             # Camadas determinísticas complementadas pelo LLM fallback
 
 
 class Address(BaseModel):
@@ -161,6 +185,11 @@ class Invoice(BaseModel):
     # princípio do Address/Party acima.
     energy: EnergyMetrics = Field(default_factory=EnergyMetrics)
 
+    # Tipo operacional da fatura — inferido por regras (não lido diretamente
+    # do documento). None quando a fatura não é de energia ou não há sinais
+    # suficientes para classificar com segurança.
+    tipo_fatura_operacional: Optional[TipoFaturaOperacional] = None
+
     # Totais
     subtotal: NumericValue = None
     discount: NumericValue = None
@@ -213,15 +242,46 @@ class Invoice(BaseModel):
             return digits
         return v
 
+    # Ordem canônica dos campos no JSON de saída.
+    # Campos não listados (ex: adicionados no futuro) vão ao final.
+    _OUTPUT_KEY_ORDER: ClassVar[list[str]] = [
+        # Identificação e classificação
+        "invoice_number", "invoice_layout", "tipo_fatura_operacional",
+        "access_key", "series",
+        # Datas
+        "issue_date", "due_date", "service_period_start", "service_period_end",
+        # Partes
+        "supplier", "customer",
+        # Itens, tributos e métricas de energia
+        "line_items", "taxes", "energy",
+        # Totais e moeda
+        "subtotal", "discount", "total_taxes", "total", "currency",
+        # Pagamento
+        "payment_method", "payment_terms", "bank_slip_barcode", "bank_slip_line",
+        # Metadados de processamento
+        "source_file", "parsing_method",
+        "confidence_score_initial", "confidence_score",
+        "notes", "errors",
+    ]
+
     def to_output_dict(self) -> dict:
         """
-        Serializa para o dicionário de saída final, seguindo o layout padrão
-        do schema. Todas as chaves do modelo são incluídas — campos sem valor
-        aparecem como null — exceto `raw_text`, que é dado interno de
-        depuração e nunca faz parte do schema de saída.
+        Serializa para o dicionário de saída final.
+
+        Transformações aplicadas (sem remover dados):
+          - Endereço de supplier e customer é achatado: os campos de Address
+            sobem um nível (invoice.supplier.city em vez de
+            invoice.supplier.address.city), eliminando um nível de nesting.
+          - Campos reordenados em grupos semânticos (identificação → datas →
+            partes → itens → totais → pagamento → metadados).
+
+        Todas as chaves do modelo estão presentes no JSON de saída — campos
+        sem valor aparecem como null. Exceção: `raw_text` (dado interno de
+        depuração, nunca faz parte do schema de saída).
         """
-        return self.model_dump(
-            exclude={"raw_text"},
-            exclude_none=False,
-            mode="json",
-        )
+        d = self.model_dump(exclude={"raw_text"}, exclude_none=False, mode="json")
+
+        # Reconstrói o dict na ordem canônica; campos desconhecidos vão ao final
+        ordered: dict = {k: d[k] for k in self._OUTPUT_KEY_ORDER if k in d}
+        ordered.update({k: v for k, v in d.items() if k not in ordered})
+        return ordered

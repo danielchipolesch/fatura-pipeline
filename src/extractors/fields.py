@@ -427,7 +427,31 @@ def extract_phone(text: str) -> Optional[str]:
 
 
 def extract_br_state(text: str) -> Optional[str]:
-    """Extrai sigla de estado brasileiro válida do texto."""
+    """
+    Extrai sigla de estado brasileiro válida do texto.
+
+    Prioridade:
+      1. Rótulo explícito  "UF: SP" / "ESTADO: MG" — mais confiável, evita
+         capturar siglas de outros contextos (ex: abreviações de empresas,
+         nomes de colunas, unidades de medida).
+      2. Padrão CIDADE/UF  "GUARATINGUETA/SP" — comum em endereços NF-e.
+      3. Primeira sigla solta válida — fallback quando não há rótulo nem
+         padrão de barra (comportamento original).
+    """
+    # 1. Rótulo explícito
+    m = re.search(r"\bU\.?F\.?\s*[:\-]?\s*([A-Z]{2})\b", text)
+    if m and m.group(1) in _BR_STATES:
+        return m.group(1)
+    m = re.search(r"\bESTADO\s*[:\-]?\s*([A-Z]{2})\b", text, re.IGNORECASE)
+    if m and m.group(1) in _BR_STATES:
+        return m.group(1)
+
+    # 2. Padrão CIDADE/UF (ou CIDADE - UF) em endereços
+    m = re.search(r"[A-ZÀ-Ú]{3,}[^/\n]{0,30}[/ -]([A-Z]{2})\b", text)
+    if m and m.group(1) in _BR_STATES:
+        return m.group(1)
+
+    # 3. Primeira sigla solta válida
     for m in re.finditer(r"\b([A-Z]{2})\b", text):
         if m.group(1) in _BR_STATES:
             return m.group(1)

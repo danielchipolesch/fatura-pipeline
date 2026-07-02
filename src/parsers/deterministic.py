@@ -192,16 +192,28 @@ class _FieldExtractor:
         # Estado: somente siglas válidas de UF brasileiras
         state = extract_br_state(block_text)
 
-        # Município: após label explícito
+        # Município: após label explícito, ou inline CIDADE/UF
         city_m = re.search(
             r"(?:MUN[IÍ]C[IÍ]PIO|CIDADE|MUNIC[ÍI]PIO)\s*[:\s]+([^\n,/]{3,40})",
             block_text, re.IGNORECASE,
         )
+        city: Optional[str] = city_m.group(1).strip() if city_m else None
+        if not city:
+            inline_m = re.search(
+                r"\b([A-ZÀ-Ú][A-ZÀ-Ú\s]{2,38}?)\s*/\s*([A-Z]{2})\b",
+                block_text.upper(),
+            )
+            if inline_m:
+                candidate_state = extract_br_state(inline_m.group(2))
+                if candidate_state:
+                    city = inline_m.group(1).strip()
+                    if not state:
+                        state = candidate_state
 
         address = Address(
             zip_code=f"{cep_m.group(1)}-{cep_m.group(2)}" if cep_m else None,
             state=state,
-            city=city_m.group(1).strip() if city_m else None,
+            city=city,
         )
 
         return Party(
@@ -224,8 +236,15 @@ class _FieldExtractor:
             )
             if m:
                 name = re.sub(r"\s+", " ", m.group(1)).strip()
-                # CNPJ será injetado a partir da chave de acesso em parse()
-                return cls._build_party(name, text[:1500])
+                # Endereço: usa a seção EMITENTE quando encontrada (evita cruzar
+                # com o bloco DESTINATÁRIO que aparece próximo em DANFEs).
+                # Fallback para os primeiros 1500 chars se a seção não for achada.
+                emitente_m = re.search(r"EMIT[EI]NTE", text, re.IGNORECASE)
+                if emitente_m:
+                    block_text = text[emitente_m.start(): emitente_m.start() + 600]
+                else:
+                    block_text = text[:1500]
+                return cls._build_party(name, block_text)
 
             # Fallback: primeiras linhas antes de "DANFE" (lado esquerdo do cabeçalho)
             danfe_pos = re.search(r"\bDANFE\b", text, re.IGNORECASE)
@@ -610,19 +629,31 @@ def _extract_line_items_from_text(text: str, layout: InvoiceLayout) -> list[Line
 
 class DeterministicParser:
 
-    def parse(self, content: DocumentContent, layout: InvoiceLayout) -> Invoice:
+    def parse(
+        self,
+        content: DocumentContent,
+        layout: InvoiceLayout,
+        prefilled: dict | None = None,
+    ) -> Invoice:
         """
-        Extrai todos os campos da fatura de forma determinística.
+        Extrai campos da fatura de forma determinística (regex).
+
+        Quando `prefilled` é fornecido (dict vindo do DoclingExtractor), os campos
+        já extraídos são usados diretamente e o regex correspondente é ignorado.
+        Isso permite que o DoclingExtractor seja a camada primária e o regex seja
+        apenas o fallback para o que o Docling não detectou.
+
         Retorna um Invoice com confidence_score calculado.
         """
         text = content.full_text
         ext = _FieldExtractor
+        pre = prefilled or {}
 
         # -- Chave de acesso / código de barras (extraído antes do número para NF-e) --
-        access_key = None
+        access_key = pre.get("access_key")
         barcode = None
         barcode_line = None
-        if layout == InvoiceLayout.NFE:
+        if layout == InvoiceLayout.NFE and not access_key:
             access_key = extract_access_key(text)
 
         # -- Campos base --
@@ -630,15 +661,73 @@ class DeterministicParser:
         if layout == InvoiceLayout.NFE and access_key and len(access_key) == 44:
             invoice_number = str(int(access_key[25:34]))
         else:
-            invoice_number = ext.invoice_number(text, layout)
+            invoice_number = pre.get("invoice_number") or ext.invoice_number(text, layout)
 
-        issue_date = ext.issue_date(text, layout)
-        due_date = ext.due_date(text, layout)
-        supplier = ext.supplier(text, layout)
-        customer = ext.customer(text, layout)
-        # Só rótulos por enquanto — o fallback de "maior valor monetário" só é
-        # tentado mais abaixo, como ÚLTIMO recurso (ver comentário da âncora MTE).
-        total = ext.total_via_labels(text, layout)
+        issue_date = pre.get("issue_date") or ext.issue_date(text, layout)
+        due_date = pre.get("due_date") or ext.due_date(text, layout)
+
+        # Supplier: se DoclingExtractor já extraiu nome/cnpj, usa como base e
+        # complementa com regex (endereço, e-mail, telefone, IE).
+        if pre.get("supplier_name") or pre.get("supplier_cnpj"):
+            supplier = Party(
+                name=pre.get("supplier_name"),
+                cnpj=pre.get("supplier_cnpj"),
+            )
+            regex_supplier = ext.supplier(text, layout)
+            if regex_supplier:
+                if not supplier.name and regex_supplier.name:
+                    supplier.name = regex_supplier.name
+                if not supplier.cnpj and regex_supplier.cnpj:
+                    supplier.cnpj = regex_supplier.cnpj
+                if regex_supplier.address and (
+                    regex_supplier.address.city or regex_supplier.address.state
+                ):
+                    supplier.address = regex_supplier.address
+                if regex_supplier.email:
+                    supplier.email = regex_supplier.email
+                if regex_supplier.phone:
+                    supplier.phone = regex_supplier.phone
+        else:
+            supplier = ext.supplier(text, layout)
+
+        # Customer: mesma lógica do supplier.
+        if pre.get("customer_name") or pre.get("customer_cnpj"):
+            customer = Party(
+                name=pre.get("customer_name"),
+                cnpj=pre.get("customer_cnpj"),
+            )
+            regex_customer = ext.customer(text, layout)
+            if regex_customer:
+                if not customer.name and regex_customer.name:
+                    customer.name = regex_customer.name
+                if not customer.cnpj and regex_customer.cnpj:
+                    customer.cnpj = regex_customer.cnpj
+                if regex_customer.address and (
+                    regex_customer.address.city or regex_customer.address.state
+                ):
+                    customer.address = regex_customer.address
+                if regex_customer.email:
+                    customer.email = regex_customer.email
+                if regex_customer.phone:
+                    customer.phone = regex_customer.phone
+        else:
+            customer = ext.customer(text, layout)
+
+        # DoclingExtractor via kv_pairs/section_map tem prioridade para cidade/UF —
+        # substitui o valor regex que pode ter sofrido contaminação entre seções.
+        if supplier:
+            if pre.get("supplier_city"):
+                supplier.address.city = pre["supplier_city"]
+            if pre.get("supplier_state"):
+                supplier.address.state = pre["supplier_state"]
+        if customer:
+            if pre.get("customer_city"):
+                customer.address.city = pre["customer_city"]
+            if pre.get("customer_state"):
+                customer.address.state = pre["customer_state"]
+
+        # Total: DoclingExtractor via kv_pairs/spatial tem prioridade; labels regex como fallback.
+        total = pre.get("total") or ext.total_via_labels(text, layout)
         subtotal = ext.subtotal(text)
         taxes = ext.taxes(text, layout)
 

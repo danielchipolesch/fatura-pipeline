@@ -28,6 +28,12 @@ class SupplierInfo(TypedDict, total=False):
     cnpj: str
     city: str
     state: str
+    # Papel do fornecedor no setor elétrico — usado pela inferência de
+    # tipo_fatura_operacional para distinguir COMERCIALIZADORA_MLE de
+    # DISTRIBUIDORA_MLE sem depender de padrões textuais quando o CNPJ
+    # do emitente está disponível (extraído da chave de acesso NF-e).
+    # Valores: "distribuidora" | "comercializadora"
+    role: str
 
 
 # Chave: CNPJ do emitente, 14 dígitos sem formatação (extraído da chave de
@@ -38,30 +44,35 @@ KNOWN_SUPPLIERS: dict[str, SupplierInfo] = {
         "cnpj": "06.981.176/0001-58",
         "city": "BELO HORIZONTE",
         "state": "MG",
+        "role": "comercializadora",  # CEMIG GT atua como comercializadora no ACL
     },
     "06981180000116": {
         "name": "CEMIG DISTRIBUIÇÃO S.A.",
         "cnpj": "06.981.180/0001-16",
         "city": "BELO HORIZONTE",
         "state": "MG",
+        "role": "distribuidora",
     },
     "07047251000170": {
         "name": "Companhia Energética do Ceará - Enel Ceará",
         "cnpj": "07.047.251/0001-70",
         "city": "FORTALEZA",
         "state": "CE",
+        "role": "distribuidora",
     },
     "61695227000193": {
         "name": "ENEL DISTRIBUIÇÃO SÃO PAULO",
         "cnpj": "61.695.227/0001-93",
         "city": "SÃO PAULO",
         "state": "SP",
+        "role": "distribuidora",
     },
     "02341467000120": {
         "name": "AMAZONAS ENERGIA",
         "cnpj": "02.341.467/0001-20",
         "city": "MANAUS",
         "state": "AM",
+        "role": "distribuidora",
     },
 }
 

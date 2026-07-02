@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 from datetime import date
 from typing import Optional
 
@@ -29,6 +30,11 @@ from loguru import logger
 
 from src.extractors.fields import parse_currency
 from src.models.invoice import Invoice, LineItem, ParsingMethod
+
+try:
+    from src.parsers.docling_loader import DocumentContent
+except ImportError:
+    DocumentContent = None  # type: ignore[assignment,misc]
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -72,10 +78,18 @@ não se limite apenas aos prioritários:
 - line_items: lista de objetos {{"description": string, "quantity": number, "unit_price": number, "total": number}}
   com os principais itens/serviços da fatura (no máximo 5 itens, os mais relevantes)
 
-Texto da fatura (primeiros 4000 caracteres):
+{context_section}Texto da fatura (até 6000 caracteres):
 ---
 {text}
 ---
+"""
+
+_SECTION_CONTEXT_TEMPLATE = """\
+Contexto específico para os campos prioritários:
+---
+{section_text}
+---
+
 """
 
 # ---------------------------------------------------------------------------
@@ -113,13 +127,26 @@ class LLMFallback:
     # API pública
     # ------------------------------------------------------------------
 
-    def enrich(self, invoice: Invoice, missing_fields: list[str]) -> Invoice:
+    def enrich(self, invoice: Invoice, missing_fields: list[str], content=None) -> Invoice:
         """
         Tenta preencher os campos ausentes via Ollama e retorna o Invoice atualizado.
         O processamento é síncrono — bloqueia até receber a resposta da LLM.
         Nunca sobrescreve campos já preenchidos pelo parser determinístico.
+
+        Quando `content` (DocumentContent) é fornecido:
+          - usa content.markdown (mais rico — inclui tabelas formatadas) em vez de raw_text
+          - injeta seções específicas do section_map para campos prioritários (section-scoped context)
         """
-        if not self._enabled or not missing_fields or not invoice.raw_text:
+        if not self._enabled or not missing_fields:
+            return invoice
+
+        has_content = content is not None and DocumentContent is not None
+        source_text = (
+            content.markdown if has_content and content.markdown
+            else (invoice.raw_text or "")
+        )
+
+        if not source_text:
             return invoice
 
         logger.info(
@@ -131,9 +158,12 @@ class LLMFallback:
             logger.warning("Modelo indisponível — LLM fallback ignorado.")
             return invoice
 
+        context_section = _build_section_context(missing_fields, content) if has_content else ""
+
         prompt = _USER_PROMPT_TEMPLATE.format(
             fields="\n".join(f"- {f}" for f in missing_fields),
-            text=invoice.raw_text[:4000],
+            context_section=context_section,
+            text=source_text[:6000],
         )
 
         try:
@@ -265,6 +295,46 @@ class LLMFallback:
 # ---------------------------------------------------------------------------
 # Funções auxiliares (puras — sem estado)
 # ---------------------------------------------------------------------------
+
+_SUPPLIER_FIELDS = {"supplier_name", "supplier_cnpj", "supplier_cpf", "supplier_city", "supplier_state"}
+_CUSTOMER_FIELDS = {"customer_name", "customer_cnpj", "customer_cpf", "customer_city", "customer_state"}
+
+_SUPPLIER_SECTION_KEYS = {"emitente", "fornecedor", "remetente", "vendedor", "prestador"}
+_CUSTOMER_SECTION_KEYS = {"destinatario", "destinatário", "cliente", "tomador", "comprador"}
+
+
+def _build_section_context(missing_fields: list[str], content) -> str:
+    """
+    Constrói um bloco de contexto focado nas seções relevantes para os campos ausentes.
+    Usa content.section_map (dict[str, str]) para mapear nomes de seção ao seu texto.
+    Retorna string pronta para inserção no prompt (vazia se nada relevante encontrado).
+    """
+    if content is None or not getattr(content, "section_map", None):
+        return ""
+
+    missing_set = {f.split(" — ")[0].strip() for f in missing_fields}
+    section_map: dict = content.section_map
+
+    sections_needed: list[str] = []
+
+    need_supplier = bool(missing_set & _SUPPLIER_FIELDS)
+    need_customer = bool(missing_set & _CUSTOMER_FIELDS)
+
+    for section_name, section_text in section_map.items():
+        key = section_name.lower().strip()
+        key = unicodedata.normalize("NFD", key)
+        key = "".join(c for c in key if unicodedata.category(c) != "Mn")
+
+        if need_supplier and any(k in key for k in _SUPPLIER_SECTION_KEYS):
+            sections_needed.append(f"[{section_name}]\n{section_text[:800]}")
+        elif need_customer and any(k in key for k in _CUSTOMER_SECTION_KEYS):
+            sections_needed.append(f"[{section_name}]\n{section_text[:800]}")
+
+    if not sections_needed:
+        return ""
+
+    combined = "\n\n".join(sections_needed)
+    return _SECTION_CONTEXT_TEMPLATE.format(section_text=combined)
 
 def _parse_json(text: str) -> dict:
     """Extrai JSON da resposta, tolerante a markdown code fences."""

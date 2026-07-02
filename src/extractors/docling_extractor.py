@@ -1,0 +1,504 @@
+"""
+Extrator primário de campos de faturas usando a estrutura semântica do DoclingDocument.
+
+Opera sobre DocumentContent enriquecido (section_map, kv_pairs, spatial_index,
+page_texts) gerado pelo DoclingLoader. É a primeira camada do pipeline de extração —
+o DeterministicParser (regex) só processa campos que este extrator não conseguiu
+preencher.
+
+Estratégia por campo (em ordem de confiança decrescente):
+  1. kv_pairs    — pares chave-valor detectados pelo modelo de layout (maior confiança)
+  2. section_map — texto do bloco da seção + regex scoped (menor ruído que busca global)
+  3. spatial_index — busca por proximidade visual (elimina hacks posicionais)
+  4. page_texts  — regex scoped por página (reduz falsos positivos cross-page)
+"""
+from __future__ import annotations
+
+import re
+from datetime import date
+from typing import Optional
+
+from loguru import logger
+
+from src.extractors.fields import (
+    extract_br_state,
+    extract_cnpj,
+    extract_date,
+    parse_currency,
+)
+from src.models.invoice import InvoiceLayout
+from src.parsers.docling_loader import DocumentContent, SpatialElement
+
+# ---------------------------------------------------------------------------
+# Padrões de chave para matching em kv_pairs
+# ---------------------------------------------------------------------------
+
+_KV_INVOICE_NUMBER = [
+    "número da nota", "n.o da nota", "nf", "nota fiscal", "número", "fatura", "nota",
+]
+_KV_ISSUE_DATE = [
+    "data de emissão", "data emissão", "emissão", "emitida em",
+]
+_KV_DUE_DATE = [
+    "data de vencimento", "data vencimento", "vencimento", "pagar até",
+    "data limite", "due date",
+]
+_KV_TOTAL = [
+    "valor total", "total a pagar", "valor do documento", "valor cobrado",
+    "total fatura", "valor fatura", "total",
+]
+_KV_CNPJ = [
+    "cnpj", "cnpj/cpf", "cpf/cnpj",
+]
+_KV_CITY = [
+    "município", "municipio", "munic.", "cidade",
+]
+_KV_STATE = [
+    "u.f.", "uf", "estado",
+]
+
+# ---------------------------------------------------------------------------
+# Nomes de seção para matching em section_map
+# ---------------------------------------------------------------------------
+
+_SECTIONS_SUPPLIER = [
+    "EMITENTE",
+    "EMIT.",
+    "PRESTADOR DE SERVIÇOS",
+    "PRESTADOR",
+    "BENEFICIÁRIO",
+    "CEDENTE",
+    "CONCESSIONÁRIA",
+    "DISTRIBUIDORA",
+    "FORNECEDOR",
+]
+_SECTIONS_CUSTOMER = [
+    "DESTINATÁRIO",
+    "DESTINATÁRIO/REMETENTE",
+    "TOMADOR DE SERVIÇOS",
+    "TOMADOR",
+    "SACADO",
+    "PAGADOR",
+    "CONSUMIDOR",
+    "CLIENTE",
+    "UNIDADE CONSUMIDORA",
+]
+
+# Linha de ruído: só labels, só números, e-mail avulso, CEP, etc.
+_NOISE_LINE_RE = re.compile(
+    r"^(CNPJ|CPF|IE|IM|CEP|ENDEREÇO|END\.|E-MAIL|FONE|TEL|FAX|"
+    r"INSCRI|MUNIC[IÍ]PIO|CIDADE|ESTADO|UF|BAIRRO|RUA|AV\.|LOGRADOURO|"
+    r"RAZÃO\s+SOCIAL|NOME)[:\s]",
+    re.IGNORECASE,
+)
+
+# Rótulos de seção que aparecem literalmente na linha (ex: "EMITENTE:" dentro do texto)
+_SECTION_LABEL_INLINE_RE = re.compile(
+    r"^(EMITENTE|DESTINAT[ÁA]RIO|TOMADOR|PRESTADOR|SACADO|CEDENTE"
+    r"|BENEFICI[ÁA]RIO|CONSUMIDOR|CLIENTE)\b",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# DoclingExtractor
+# ---------------------------------------------------------------------------
+
+class DoclingExtractor:
+    """
+    Camada primária de extração: usa a estrutura semântica do Docling.
+    Retorna um dict parcial com os campos extraídos com alta confiança.
+    O DeterministicParser usa esse dict para pular regex nos campos já preenchidos.
+    """
+
+    def extract(self, content: DocumentContent, layout: InvoiceLayout) -> dict:
+        """
+        Extrai campos estruturais do documento.
+        Retorna dict parcial — apenas campos onde a extração teve sucesso.
+        """
+        result: dict = {}
+
+        self._from_kv_pairs(content, result)
+        self._from_sections(content, result)
+        self._from_spatial(content, layout, result)
+        self._from_page_texts(content, layout, result)
+
+        n = len(result)
+        logger.debug(
+            f"DoclingExtractor: {n} campo(s) extraído(s): {list(result.keys())}"
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # 1. Extração via kv_pairs (pares nativos do Docling)
+    # ------------------------------------------------------------------
+
+    def _from_kv_pairs(self, content: DocumentContent, result: dict) -> None:
+        if not content.kv_pairs:
+            return
+
+        # Acumula valores por tipo para distinguir supplier vs customer pela ordem
+        cnpj_list:  list[str] = []
+        city_list:  list[str] = []
+        state_list: list[str] = []
+
+        for key, value in content.kv_pairs:
+            key_lower = key.lower().strip()
+            value_stripped = value.strip()
+
+            if "invoice_number" not in result and _kv_matches(key_lower, _KV_INVOICE_NUMBER):
+                if value_stripped and value_stripped not in ("0", ""):
+                    result["invoice_number"] = value_stripped
+
+            if "issue_date" not in result and _kv_matches(key_lower, _KV_ISSUE_DATE):
+                d = extract_date(value_stripped)
+                if d:
+                    result["issue_date"] = d
+
+            if "due_date" not in result and _kv_matches(key_lower, _KV_DUE_DATE):
+                d = extract_date(value_stripped)
+                if d:
+                    result["due_date"] = d
+
+            if "total" not in result and _kv_matches(key_lower, _KV_TOTAL):
+                v = parse_currency(value_stripped)
+                if v and v > 0:
+                    result["total"] = v
+
+            if _kv_matches(key_lower, _KV_CNPJ):
+                cnpj = extract_cnpj(value_stripped)
+                if cnpj and cnpj not in cnpj_list:
+                    cnpj_list.append(cnpj)
+
+            if _kv_matches(key_lower, _KV_CITY) and value_stripped:
+                v = value_stripped.upper()
+                if v not in city_list:
+                    city_list.append(v)
+
+            if _kv_matches(key_lower, _KV_STATE) and len(value_stripped) == 2:
+                v = value_stripped.upper()
+                if v not in state_list:
+                    state_list.append(v)
+
+        # Heurística de ordem: 1ª ocorrência = supplier, 2ª = customer
+        if cnpj_list and "supplier_cnpj" not in result:
+            result["supplier_cnpj"] = cnpj_list[0]
+        if len(cnpj_list) >= 2 and "customer_cnpj" not in result:
+            result["customer_cnpj"] = cnpj_list[1]
+
+        if city_list and "supplier_city" not in result:
+            result["supplier_city"] = city_list[0]
+        if len(city_list) >= 2 and "customer_city" not in result:
+            result["customer_city"] = city_list[1]
+
+        if state_list and "supplier_state" not in result:
+            result["supplier_state"] = state_list[0]
+        if len(state_list) >= 2 and "customer_state" not in result:
+            result["customer_state"] = state_list[1]
+
+    # ------------------------------------------------------------------
+    # 2. Extração via section_map (blocos de seção tipados)
+    # ------------------------------------------------------------------
+
+    def _from_sections(self, content: DocumentContent, result: dict) -> None:
+        if not content.section_map:
+            return
+
+        supplier_text = _get_section_text(content.section_map, _SECTIONS_SUPPLIER)
+        if supplier_text:
+            if "supplier_cnpj" not in result:
+                cnpj = extract_cnpj(supplier_text)
+                if cnpj:
+                    result["supplier_cnpj"] = cnpj
+
+            if "supplier_name" not in result:
+                name = _first_substantive_line(supplier_text)
+                if name:
+                    result["supplier_name"] = name
+
+            city, state = _extract_city_state(supplier_text)
+            if city and "supplier_city" not in result:
+                result["supplier_city"] = city
+            if state and "supplier_state" not in result:
+                result["supplier_state"] = state
+
+        customer_text = _get_section_text(content.section_map, _SECTIONS_CUSTOMER)
+        if customer_text:
+            if "customer_cnpj" not in result:
+                cnpj = extract_cnpj(customer_text)
+                if cnpj:
+                    result["customer_cnpj"] = cnpj
+
+            if "customer_name" not in result:
+                name = _first_substantive_line(customer_text)
+                if name:
+                    result["customer_name"] = name
+
+            city, state = _extract_city_state(customer_text)
+            if city and "customer_city" not in result:
+                result["customer_city"] = city
+            if state and "customer_state" not in result:
+                result["customer_state"] = state
+
+    # ------------------------------------------------------------------
+    # 3. Extração via spatial_index (proximidade visual — bounding boxes)
+    # ------------------------------------------------------------------
+
+    def _from_spatial(
+        self, content: DocumentContent, layout: InvoiceLayout, result: dict
+    ) -> None:
+        if not content.spatial_index:
+            return
+
+        # Total via âncora espacial (substitui o hack "MTE\d{7}")
+        if "total" not in result:
+            total_labels = [
+                r"TOTAL\s+A\s+PAGAR",
+                r"VALOR\s+TOTAL",
+                r"VALOR\s+DO\s+DOCUMENTO",
+                r"TOTAL\s+FATURA",
+                r"\bTOTAL\b",
+            ]
+            for label_pattern in total_labels:
+                val_text = _spatial_right_or_below(
+                    content.spatial_index, label_pattern,
+                    value_pattern=r"[\d.,]+",
+                )
+                if val_text:
+                    v = parse_currency(val_text)
+                    if v and v > 0:
+                        result["total"] = v
+                        break
+
+        # Data de vencimento via âncora espacial
+        if "due_date" not in result:
+            due_labels = [
+                r"VENCIMENTO",
+                r"DATA\s+(?:DE\s+)?VENCIMENTO",
+                r"PAGAR\s+AT[EÉ]",
+            ]
+            for label_pattern in due_labels:
+                val_text = _spatial_right_or_below(
+                    content.spatial_index, label_pattern,
+                    value_pattern=r"\d{2}[/\-.]\d{2}[/\-.]\d{4}",
+                )
+                if val_text:
+                    d = extract_date(val_text)
+                    if d:
+                        result["due_date"] = d
+                        break
+
+        # Data de emissão via âncora espacial
+        if "issue_date" not in result:
+            issue_labels = [
+                r"DATA\s+(?:DE\s+)?EMISS[ÃA]O",
+                r"EMISS[ÃA]O",
+                r"EMITIDA?\s+EM",
+            ]
+            for label_pattern in issue_labels:
+                val_text = _spatial_right_or_below(
+                    content.spatial_index, label_pattern,
+                    value_pattern=r"\d{2}[/\-.]\d{2}[/\-.]\d{4}",
+                )
+                if val_text:
+                    d = extract_date(val_text)
+                    if d:
+                        result["issue_date"] = d
+                        break
+
+    # ------------------------------------------------------------------
+    # 4. Extração via page_texts (regex scoped por página)
+    # ------------------------------------------------------------------
+
+    def _from_page_texts(
+        self, content: DocumentContent, layout: InvoiceLayout, result: dict
+    ) -> None:
+        if not content.page_texts:
+            return
+
+        page_1 = content.page_texts.get(1, "")
+
+        # Chave de acesso NF-e: sempre na pág. 1 (reduz falso-positivos de
+        # sequências de 44 dígitos que possam aparecer em outras páginas)
+        if layout == InvoiceLayout.NFE and "access_key" not in result and page_1:
+            from src.extractors.fields import extract_access_key
+            ak = extract_access_key(page_1)
+            if ak:
+                result["access_key"] = ak
+
+        # Número da nota via pág. 1 (para NFe/NFSe que têm o número no cabeçalho)
+        if layout in (InvoiceLayout.NFE, InvoiceLayout.NFSE):
+            if "invoice_number" not in result and page_1:
+                m = re.search(
+                    r"N[°ºo\.]\s*(?:da\s+)?(?:Nota|NF)?\s*[:\s]+(\d+)",
+                    page_1, re.IGNORECASE,
+                )
+                if m:
+                    val = m.group(1).strip()
+                    if val and val not in ("0", ""):
+                        result["invoice_number"] = val
+
+
+# ---------------------------------------------------------------------------
+# Funções auxiliares (puras — sem estado)
+# ---------------------------------------------------------------------------
+
+def _kv_matches(key_lower: str, patterns: list[str]) -> bool:
+    """Verifica se algum padrão está contido na chave (busca por substring)."""
+    return any(p in key_lower for p in patterns)
+
+
+def _get_section_text(section_map: dict, candidates: list[str]) -> str | None:
+    """
+    Retorna o texto da primeira seção encontrada dentre os nomes candidatos.
+    Tenta correspondência exata primeiro; depois correspondência parcial
+    (seção que CONTÉM o nome do candidato — ex: "PRESTADOR DE SERVIÇOS ELETRÔNICOS"
+    contém "PRESTADOR DE SERVIÇOS").
+    """
+    section_upper = {k.upper(): v for k, v in section_map.items()}
+    for candidate in candidates:
+        cand_upper = candidate.upper()
+        # Exata
+        if cand_upper in section_upper:
+            return section_upper[cand_upper]
+        # Parcial: seção cujo nome contém o candidato
+        for sec_key, sec_text in section_upper.items():
+            if cand_upper in sec_key:
+                return sec_text
+    return None
+
+
+def _extract_city_state(text: str) -> tuple[str | None, str | None]:
+    """
+    Extrai cidade e UF de um bloco de texto de endereço (seção EMITENTE ou
+    DESTINATÁRIO extraída pelo Docling).
+
+    Estratégias em ordem de confiança:
+      1. Rótulo explícito: "MUNICÍPIO: GUARATINGUETA" + "U.F.: SP"
+      2. Padrão inline sem rótulo: "GUARATINGUETA/SP" ou "GUARATINGUETA - SP"
+    """
+    text_upper = text.upper()
+    city: str | None = None
+    state: str | None = None
+
+    # 1a. Cidade com rótulo
+    city_m = re.search(
+        r"(?:MUN[IÍ]C[IÍ]PIO|MUNICIPIO|CIDADE)\s*[:\s]+([A-ZÀ-Ú][^\n,/]{2,38}?)(?:\s*(?:U\.?F|$|\n))",
+        text_upper,
+    )
+    if city_m:
+        city = city_m.group(1).strip()
+
+    # 1b. UF com rótulo
+    uf_m = re.search(r"\bU\.?F\.?\s*[:\-]?\s*([A-Z]{2})\b", text_upper)
+    if uf_m:
+        candidate = uf_m.group(1)
+        if extract_br_state(candidate):
+            state = candidate
+
+    # 2. Padrão inline "CIDADE/UF" — cobre layouts sem rótulos explícitos
+    if not city or not state:
+        inline_m = re.search(
+            r"\b([A-ZÀ-Ú][A-ZÀ-Ú\s]{2,38}?)\s*/\s*([A-Z]{2})\b",
+            text_upper,
+        )
+        if inline_m:
+            candidate_state = extract_br_state(inline_m.group(2))
+            if candidate_state:
+                if not city:
+                    city = inline_m.group(1).strip()
+                if not state:
+                    state = candidate_state
+
+    return city, state
+
+
+def _first_substantive_line(text: str) -> str | None:
+    """
+    Retorna a primeira linha não-vazia que represente um nome de empresa/pessoa.
+    Filtra:
+      - Linhas que são rótulos (CNPJ, CEP, Endereço, etc.)
+      - Linhas que são só rótulo de seção (ex: "EMITENTE:")
+      - Linhas puramente numéricas / datas / valores monetários
+      - Linhas muito curtas (< 4 chars)
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or len(line) < 4:
+            continue
+        if _NOISE_LINE_RE.match(line):
+            continue
+        if _SECTION_LABEL_INLINE_RE.match(line):
+            continue
+        if re.match(r"^[\d.,/\-\s]+$", line):
+            continue
+        if re.match(r"^\d{2}/\d{2}/\d{4}$", line):
+            continue
+        return line
+    return None
+
+
+def _spatial_right_or_below(
+    spatial_index: list[SpatialElement],
+    label_pattern: str,
+    page_no: int | None = None,
+    value_pattern: str | None = None,
+) -> str | None:
+    """
+    Busca o elemento de texto mais próximo à direita ou imediatamente abaixo
+    de um elemento que casa com label_pattern.
+
+    Retorna o texto do elemento candidato mais próximo que satisfaz
+    value_pattern (se fornecido). Retorna None se nada for encontrado.
+
+    Lógica de proximidade:
+      - À direita: mesmo band vertical (centros dentro de ½ altura do rótulo),
+        bbox_l do candidato >= bbox_r do rótulo (com tolerância de 2 pts).
+      - Abaixo: bbox_t do candidato dentro de 2 alturas do rótulo abaixo de
+        bbox_b, horizontalmente alinhado com o rótulo (±10 pts).
+      - Candidatos "à direita" têm prioridade sobre os "abaixo" (bias = +1000).
+    """
+    label_re = re.compile(label_pattern, re.IGNORECASE)
+    val_re = re.compile(value_pattern, re.IGNORECASE) if value_pattern else None
+
+    for elem in spatial_index:
+        if page_no is not None and elem.page_no != page_no:
+            continue
+        if not label_re.search(elem.text):
+            continue
+
+        mid_y = (elem.bbox_t + elem.bbox_b) / 2
+        height = max(elem.bbox_b - elem.bbox_t, 1.0)
+
+        candidates: list[tuple[float, SpatialElement]] = []
+        for other in spatial_index:
+            if other is elem or other.page_no != elem.page_no:
+                continue
+            if val_re and not val_re.search(other.text):
+                continue
+
+            other_mid_y = (other.bbox_t + other.bbox_b) / 2
+
+            # À direita: mesma linha (centros verticais próximos)
+            if (
+                abs(other_mid_y - mid_y) <= height * 0.7
+                and other.bbox_l >= elem.bbox_r - 2
+            ):
+                dist = other.bbox_l - elem.bbox_r
+                candidates.append((dist, other))
+
+            # Abaixo: próxima linha, alinhado horizontalmente com o rótulo
+            elif (
+                other.bbox_t >= elem.bbox_b - 2
+                and other.bbox_t <= elem.bbox_b + height * 2
+                and other.bbox_l >= elem.bbox_l - 10
+                and other.bbox_r <= elem.bbox_r + 10
+            ):
+                dist = (other.bbox_t - elem.bbox_b) + 1000
+                candidates.append((dist, other))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            return candidates[0][1].text
+
+    return None
