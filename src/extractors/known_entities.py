@@ -74,6 +74,27 @@ KNOWN_SUPPLIERS: dict[str, SupplierInfo] = {
         "state": "AM",
         "role": "distribuidora",
     },
+    "10732440000197": {
+        "name": "COMERC POWER TRADING LTDA",
+        "cnpj": "10.732.440/0001-97",
+        "city": "SÃO PAULO",
+        "state": "SP",
+        "role": "comercializadora",
+    },
+    "60444437000146": {
+        "name": "LIGHT SERVIÇOS DE ELETRICIDADE S.A.",
+        "cnpj": "60.444.437/0001-46",
+        "city": "RIO DE JANEIRO",
+        "state": "RJ",
+        "role": "distribuidora",
+    },
+    "02016440000162": {
+        "name": "RGE SUL DISTRIBUIDORA DE ENERGIA S.A.",
+        "cnpj": "02.016.440/0001-62",
+        "city": "SÃO LEOPOLDO",
+        "state": "RS",
+        "role": "distribuidora",
+    },
 }
 
 # Fallback por nome literal: usado quando o layout não imprime o CNPJ do
@@ -87,6 +108,9 @@ KNOWN_SUPPLIER_NAME_PATTERNS: list[tuple[str, str]] = [
     (r"CEMIG\s+DISTRIBUI[ÇC][ÃA]O", "06981180000116"),
     (r"CEMIG\s+GERA[ÇC][ÃA]O\s+E\s+TRANSMISS[ÃA]O", "06981176000158"),
     (r"COMPANHIA\s+ENERG[ÉE]TICA\s+D.?\s*O?\s*CEAR[ÁA]", "07047251000170"),
+    (r"COMERC\s+POWER\s+TRADING", "10732440000197"),
+    (r"LIGHT\s+SERVI[ÇC]OS\s+DE\s+ELETRICIDADE", "60444437000146"),
+    (r"RGE\s+SUL\s+DISTRIBUIDORA", "02016440000162"),
 ]
 
 # Chave: raiz do CNPJ do destinatário (8 primeiros dígitos — identifica a

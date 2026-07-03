@@ -38,9 +38,11 @@ from src.extractors.fields import (
     extract_date_before_currency,
     extract_demand_overage_value,
     extract_email,
+    extract_energy_quantity_mwh,
     extract_labeled_value,
     extract_lines_after_label,
     extract_measured_demand_kw,
+    extract_tarifa_azul_demand_nf3e,
     extract_number_after_hex_signature,
     extract_phone,
     extract_reactive_excess,
@@ -574,6 +576,40 @@ def _extract_line_items_from_tables(tables: list[pd.DataFrame]) -> list[LineItem
                 except Exception:
                     pass
 
+            # Fallback 1: Docling às vezes inverte header/dado em tabelas NF-e
+            # (ex: o valor numérico da quantidade fica no nome da coluna, não
+            # na célula). Detecta pelo fato de qty_col ser "QUANT..." mas ter
+            # valor não-numérico na célula → tenta parse do próprio nome.
+            if qty is None and qty_col and _col_match(str(qty_col), qty_aliases):
+                candidate = parse_currency(str(qty_col))
+                # Aceita apenas se o valor for plausível para uma quantidade
+                # (> 0 e < 1.000.000) e o nome der um float razoável
+                if candidate is not None and 0 < candidate < 1_000_000:
+                    qty = candidate
+
+            # Fallback 2: "V.TOTAL/V.UNITARIO <qty>" no nome de outra coluna.
+            # Docling às vezes desloca o valor para o nome da coluna de total/
+            # unitário — ex: coluna "V.TOTAL 259,3100" com valor real=40.299,37.
+            if qty is None:
+                for col in cols:
+                    m_emb = re.search(
+                        r"\bV\.?\s*(?:TOTAL|UNIT(?:ARIO)?)\s+([\d]{1,6}[.,][\d]+)\s*$",
+                        str(col), re.IGNORECASE,
+                    )
+                    if m_emb:
+                        candidate = parse_currency(m_emb.group(1))
+                        if candidate is not None and 0 < candidate < 1_000_000:
+                            qty = candidate
+                            break
+
+            # Unidade de medida: coluna "UN"/"UNID"/"UNIDADE" etc.
+            un_col = next(
+                (c for c in cols if str(c).strip().upper() in ("UN", "UNID", "UNIDADE", "UNIT", "UND")),
+                None,
+            )
+            unit_val_str = str(row.get(un_col, "")).strip() if un_col else ""
+            unit = unit_val_str if unit_val_str and unit_val_str.lower() not in ("nan", "none") else None
+
             unit_price = None
             if price_col and str(row.get(price_col, "")).strip():
                 unit_price = parse_currency(str(row[price_col]))
@@ -585,6 +621,7 @@ def _extract_line_items_from_tables(tables: list[pd.DataFrame]) -> list[LineItem
             items.append(
                 LineItem(
                     description=desc_val,
+                    unit=unit,
                     quantity=qty,
                     unit_price=unit_price,
                     total=total_val,
@@ -656,10 +693,26 @@ class DeterministicParser:
         if layout == InvoiceLayout.NFE and not access_key:
             access_key = extract_access_key(text)
 
+        # Fallback: chave de acesso como título de seção do Docling
+        # (ex: "3526 0110 7324 4000 0197 55 000 000027932..." como heading)
+        if layout == InvoiceLayout.NFE and not access_key:
+            for sec_key in content.section_map:
+                digits_only = re.sub(r"\s", "", sec_key)
+                if len(digits_only) >= 44 and digits_only[:44].isdigit():
+                    access_key = digits_only[:44]
+                    break
+
         # -- Campos base --
-        # Para NF-e, o número da nota é autoritativamente a chave de acesso (posições 25-33)
+        # Para NF-e, o número da nota vem preferencialmente do DoclingExtractor
+        # (que extrai o campo impresso no documento com zeros à esquerda preservados);
+        # a chave de acesso é usada como fallback quando nenhum outro extrator o encontrou.
         if layout == InvoiceLayout.NFE and access_key and len(access_key) == 44:
-            invoice_number = str(int(access_key[25:34]))
+            key_number = access_key[25:34]  # 9 dígitos com zeros à esquerda
+            invoice_number = (
+                pre.get("invoice_number")
+                or ext.invoice_number(text, layout)
+                or str(int(key_number))
+            )
         else:
             invoice_number = pre.get("invoice_number") or ext.invoice_number(text, layout)
 
@@ -779,6 +832,24 @@ class DeterministicParser:
             barcode = extract_boleto_barcode(text)
             barcode_line = extract_boleto_line(text)
 
+            # Boleto com chave de acesso NF-e/NF3E embarcada (44 dígitos, modelo 55/66):
+            # extrai CNPJ do emitente (pos 6-19) e preenche o fornecedor via cadastro.
+            if barcode and len(barcode) == 44 and re.match(r"^\d{44}$", barcode):
+                model_from_key = barcode[20:22]
+                if model_from_key in ("55", "66"):
+                    nfe_cnpj = barcode[6:20]
+                    known_nfe = lookup_supplier(nfe_cnpj)
+                    if known_nfe:
+                        if supplier is None:
+                            supplier = Party()
+                        if not supplier.name:
+                            supplier.name = known_nfe.get("name")
+                        if not supplier.cnpj:
+                            supplier.cnpj = known_nfe.get("cnpj")
+                        if not supplier.address.city:
+                            supplier.address.city = known_nfe.get("city")
+                            supplier.address.state = known_nfe.get("state")
+
         # -- Itens --
         line_items = _extract_line_items_from_tables(content.tables)
         if not line_items:
@@ -827,6 +898,13 @@ class DeterministicParser:
                     customer = Party(cnpj=dest_cnpj)
                 else:
                     customer.cnpj = dest_cnpj
+                # Se o CNPJ encontrado coincide com o do emitente, provavelmente
+                # extract_cnpj_after_label capturou o label do emitente — busca alternativa.
+                if emitter_cnpj and customer.cnpj == emitter_cnpj:
+                    all_cnpjs = extract_all_cnpjs(text)
+                    alt = next((c for c in all_cnpjs if c != emitter_cnpj), None)
+                    if alt:
+                        customer.cnpj = alt
             elif emitter_cnpj and customer and customer.cnpj == emitter_cnpj:
                 # Fallback: pega o segundo CNPJ distinto do emitente
                 all_cnpjs = extract_all_cnpjs(text)
@@ -859,10 +937,31 @@ class DeterministicParser:
         energy.reactive_energy_excess_offpeak_kwh = reactive["offpeak_kwh"]
         energy.reactive_penalty_peak_value = reactive["peak_value"]
         energy.reactive_penalty_offpeak_value = reactive["offpeak_value"]
-        # measured_demand_peak_kw e power_factor_measured permanecem null:
-        # não há rótulo confirmado para esses campos em nenhum layout mapeado
-        # até agora (faturas Azul trariam demanda ponta separadamente; fator
-        # de potência não aparece impresso em nenhuma amostra analisada).
+
+        # DANF3E / Tarifa Azul: demanda ponta e fora-ponta separadas
+        peak_demand, fp_demand = extract_tarifa_azul_demand_nf3e(text)
+        if peak_demand is not None:
+            energy.measured_demand_peak_kw = peak_demand
+        if fp_demand is not None:
+            energy.measured_demand_offpeak_kw = fp_demand
+
+        # NF-e de comercializadora: quantidade em MWh da linha de produto
+        # (substitui consumption_offpeak_kwh como proxy de consumo total)
+        if layout == InvoiceLayout.NFE and energy.consumption_offpeak_kwh is None:
+            mwh = extract_energy_quantity_mwh(text)
+            if mwh is not None:
+                energy.consumption_offpeak_kwh = mwh
+
+        # Fallback via line_items: item com unidade MWh e quantidade numérica
+        # (cobre casos em que o valor está na tabela Docling mas não no texto plano)
+        if layout == InvoiceLayout.NFE and energy.consumption_offpeak_kwh is None:
+            for item in line_items:
+                unit_norm = re.sub(r"[\s/]", "", (item.unit or "")).upper()
+                if "MWH" in unit_norm and item.quantity is not None:
+                    q = item.quantity
+                    if isinstance(q, (int, float)) and 0 < q < 99999:
+                        energy.consumption_offpeak_kwh = q
+                        break
 
         invoice = Invoice(
             invoice_number=invoice_number,

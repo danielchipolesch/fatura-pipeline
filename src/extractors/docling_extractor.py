@@ -71,6 +71,12 @@ _SECTIONS_SUPPLIER = [
     "CONCESSIONÁRIA",
     "DISTRIBUIDORA",
     "FORNECEDOR",
+    # DANF3E (Nota Fiscal de Energia Elétrica): o Docling agrupa o bloco
+    # do emitente sob o título do documento auxiliar em vez de uma seção
+    # "EMITENTE" explícita.
+    "DANF3E",
+    "NF3E",
+    "NOTA FISCAL DE ENERGIA",
 ]
 _SECTIONS_CUSTOMER = [
     "DESTINATÁRIO",
@@ -204,15 +210,31 @@ class DoclingExtractor:
         if not content.section_map:
             return
 
-        supplier_text = _get_section_text(content.section_map, _SECTIONS_SUPPLIER)
-        if supplier_text:
+        supplier_section = _get_section(content.section_map, _SECTIONS_SUPPLIER)
+        if supplier_section:
+            sec_key, supplier_text = supplier_section
             if "supplier_cnpj" not in result:
                 cnpj = extract_cnpj(supplier_text)
                 if cnpj:
                     result["supplier_cnpj"] = cnpj
 
             if "supplier_name" not in result:
-                name = _first_substantive_line(supplier_text)
+                # Prioridade 1: nome embutido no título da seção
+                # ex: "IDENTIFICAÇÃO DO EMITENTE COMERC POWER TRADING"
+                name = _name_from_section_key(sec_key)
+                if name:
+                    # Incorpora sufixo legal ("LTDA", "S.A.") da 1ª linha do
+                    # corpo quando ele segue imediatamente o nome truncado
+                    body_first = supplier_text.lstrip().split("\n")[0].strip()
+                    suffix_m = re.match(
+                        r"^(LTDA\.?|S\.?A\.?|EIRELI|ME|EPP)\b",
+                        body_first, re.IGNORECASE,
+                    )
+                    if suffix_m:
+                        name = name + " " + suffix_m.group(1).upper()
+                else:
+                    # Prioridade 2: primeira linha substantiva do corpo
+                    name = _first_substantive_line(supplier_text)
                 if name:
                     result["supplier_name"] = name
 
@@ -349,22 +371,44 @@ def _kv_matches(key_lower: str, patterns: list[str]) -> bool:
 
 
 def _get_section_text(section_map: dict, candidates: list[str]) -> str | None:
+    """Retorna o texto da primeira seção encontrada (exata > parcial)."""
+    result = _get_section(section_map, candidates)
+    return result[1] if result else None
+
+
+def _get_section(section_map: dict, candidates: list[str]) -> tuple[str, str] | None:
     """
-    Retorna o texto da primeira seção encontrada dentre os nomes candidatos.
-    Tenta correspondência exata primeiro; depois correspondência parcial
-    (seção que CONTÉM o nome do candidato — ex: "PRESTADOR DE SERVIÇOS ELETRÔNICOS"
-    contém "PRESTADOR DE SERVIÇOS").
+    Retorna (sec_key_original, sec_text) da primeira seção correspondente.
+    Tenta exata primeiro, depois parcial (seção cujo nome contém o candidato).
     """
-    section_upper = {k.upper(): v for k, v in section_map.items()}
+    section_upper = {k.upper(): (k, v) for k, v in section_map.items()}
     for candidate in candidates:
         cand_upper = candidate.upper()
-        # Exata
         if cand_upper in section_upper:
             return section_upper[cand_upper]
-        # Parcial: seção cujo nome contém o candidato
-        for sec_key, sec_text in section_upper.items():
-            if cand_upper in sec_key:
-                return sec_text
+        for sec_key_up, (orig_key, sec_text) in section_upper.items():
+            if cand_upper in sec_key_up:
+                return orig_key, sec_text
+    return None
+
+
+def _name_from_section_key(sec_key: str) -> str | None:
+    """
+    Extrai o nome do emitente embutido no título da seção.
+
+    Padrão: "IDENTIFICAÇÃO DO EMITENTE <NomeEmpresa>" ou
+            "IDENTIFICAÇÃO DE EMITENTE <NomeEmpresa>"
+    Retorna apenas a parte após o rótulo "EMITENTE", ou None se não houver.
+    """
+    m = re.search(
+        r"(?:IDENTIFICAÇÃO\s+D[AEO]\s+)?EMIT(?:ENTE)?\b[.:\s]+(.+)",
+        sec_key,
+        re.IGNORECASE,
+    )
+    if m:
+        name = m.group(1).strip()
+        if name and len(name) > 2:
+            return name
     return None
 
 

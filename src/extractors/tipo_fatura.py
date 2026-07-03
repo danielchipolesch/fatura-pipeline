@@ -50,6 +50,7 @@ _RE_COMPONENTE_FIO = re.compile(
 _RE_ENERGIA_ACL = re.compile(r"ENERGIA\s+ACL\b", re.IGNORECASE)
 _RE_TUSD_PONTA = re.compile(r"TUSD[\s\-]+PONTA\b", re.IGNORECASE)
 _RE_TUSD_FORA = re.compile(r"TUSD[\s\-]+(?:FORA|F\.?\s*PONTA)\b", re.IGNORECASE)
+_RE_TUSD = re.compile(r"\bTUSD\b", re.IGNORECASE)
 
 
 def infer_tipo_fatura_operacional(
@@ -191,6 +192,11 @@ def _is_distribuidora_mle(
 
     # d) Estrutura TUSD-Ponta + TUSD-Fora Ponta (ambas presentes)
     if _RE_TUSD_PONTA.search(text_upper) and _RE_TUSD_FORA.search(text_upper):
+        return True
+
+    # e) "TUSD" standalone em NF-e (NF3E/DANF3E de distribuidora Grupo A —
+    #    clientes Grupo A com TUSD explícito estão tipicamente no Mercado Livre)
+    if layout == InvoiceLayout.NFE and _RE_TUSD.search(text_upper):
         return True
 
     return False

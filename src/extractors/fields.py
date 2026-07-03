@@ -675,3 +675,96 @@ def extract_reactive_excess(text: str) -> dict[str, float | str | None]:
         result["offpeak_value"] = parse_currency_or_flag(m.group(2))
 
     return result
+
+
+def extract_tarifa_azul_demand_nf3e(text: str) -> tuple[float | str | None, float | str | None]:
+    """
+    Extrai demanda medida ponta e fora-ponta (kW) para DANF3E/NF3E em
+    Tarifa Azul.
+
+    No DANF3E, o Docling lê a tabela de itens coluna por coluna, gerando
+    texto com "Demanda P. kW" e "Demanda FP. kW" em linhas consecutivas.
+    Os valores de quantidade (kW inteiros) aparecem após 4 colunas numéricas
+    intermediárias (2 alíquotas ICMS + 2 preços unitários).
+    """
+    peak = offpeak = None
+
+    # Padrão 1: dois rótulos de demanda seguidos, depois 4 cols e os valores
+    m = re.search(
+        r"DEMANDA\s+P(?:ONTA)?\s*\.?\s*KW\s*\n"
+        r"DEMANDA\s+F(?:P|ORA\s*PONTA)?\s*\.?\s*KW\s*\n"
+        r"(?:[^\n]+\n){2,8}?"
+        r"\s*([\d]+(?:[.,]\d+)?)\s*\n"
+        r"\s*([\d]+(?:[.,]\d+)?)",
+        text, re.IGNORECASE,
+    )
+    if m:
+        v1 = parse_currency(m.group(1))
+        v2 = parse_currency(m.group(2))
+        # Os dois primeiros valores numéricos após os 4 cols são as quantidades kW
+        # Heurística: o valor de demanda kW é tipicamente < 10.000 e sem centavos
+        if v1 is not None and v1 < 10000:
+            peak = v1
+        if v2 is not None and v2 < 10000:
+            offpeak = v2
+
+    # Padrão 2: rótulos individuais com valor próximo (UTILITY ou OCR livre)
+    # "DEMANDA PONTA kW ... 501"
+    if peak is None:
+        m = re.search(
+            r"DEMANDA\s+P(?:ONTA)?\s*\.?\s*KW\b[^\n]*\n"
+            r"(?:[^\n]*\n){0,6}?"
+            r"\s*([\d]{1,6})\s*\n",
+            text, re.IGNORECASE,
+        )
+        if m:
+            v = parse_currency(m.group(1))
+            if v is not None and v < 10000:
+                peak = v
+
+    if offpeak is None:
+        m = re.search(
+            r"DEMANDA\s+F(?:P|ORA\s*PONTA)?\s*\.?\s*KW\b[^\n]*\n"
+            r"(?:[^\n]*\n){0,6}?"
+            r"\s*([\d]{1,6})\s*\n",
+            text, re.IGNORECASE,
+        )
+        if m:
+            v = parse_currency(m.group(1))
+            if v is not None and v < 10000:
+                offpeak = v
+
+    return peak, offpeak
+
+
+def extract_energy_quantity_mwh(text: str) -> float | None:
+    """
+    Extrai a quantidade de energia (MWh) de NF-e de comercializadora.
+
+    No DANFE de comercializadora, a coluna QUANT. registra o volume em MWh
+    (ex: 259,3100). Docling às vezes inverte header/dado, colocando o valor
+    da quantidade no nome da coluna do DataFrame. Esta função busca o valor
+    de quantidade MWh tanto no texto livre quanto no padrão do cabeçalho
+    da tabela ("QUANT. V.TOTAL <valor>").
+    """
+    # Padrão 1: "QUANT. [V.TOTAL] <decimal>" — cabeçalho de tabela NF-e
+    m = re.search(
+        r"\bQUANT(?:\.|\s+QUANTIDADE)?\s*(?:V\.?\s*(?:UNIT|TOTAL)\s+)?([\d]+[.,][\d]+)\b",
+        text, re.IGNORECASE,
+    )
+    if m:
+        v = parse_currency(m.group(1))
+        if v is not None and 0.001 < v < 99999:
+            return v
+
+    # Padrão 2: linha com unidade MWh próxima a um número
+    m = re.search(
+        r"([\d.,]+)\s*\n?\s*MW\s*h?\b",
+        text, re.IGNORECASE,
+    )
+    if m:
+        v = parse_currency(m.group(1))
+        if v is not None and 0.001 < v < 99999:
+            return v
+
+    return None

@@ -148,6 +148,21 @@ class FaturaPipeline:
             line_items=invoice.line_items,
         )
 
+        # Pós-processamento: boleto com chave de acesso NF-e/NF3E embarcada
+        # (44 dígitos, modelo 55/66) permite inferir o tipo pelo CNPJ do emitente.
+        if invoice.tipo_fatura_operacional is None and invoice.bank_slip_barcode:
+            bc = invoice.bank_slip_barcode
+            if len(bc) == 44 and bc.isdigit() and bc[20:22] in ("55", "66"):
+                from src.extractors.known_entities import lookup_supplier as _ls
+                from src.models.invoice import TipoFaturaOperacional as _TFO
+                _info = _ls(bc[6:20])
+                if _info:
+                    _role = _info.get("role")
+                    if _role == "distribuidora":
+                        invoice.tipo_fatura_operacional = _TFO.DISTRIBUIDORA_MLE
+                    elif _role == "comercializadora":
+                        invoice.tipo_fatura_operacional = _TFO.COMERCIALIZADORA_MLE
+
         logger.info(
             f"Extração — "
             f"method={invoice.parsing_method.value} | "
