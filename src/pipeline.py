@@ -163,11 +163,19 @@ class FaturaPipeline:
                     elif _role == "comercializadora":
                         invoice.tipo_fatura_operacional = _TFO.COMERCIALIZADORA_MLE
 
+        # Documentos escaneados (OCR): o parser determinístico operou sobre texto
+        # OCR degradado — resultados são não-confiáveis e devem ser enriquecidos
+        # pelo LLM. Força confidence=0 para garantir que o fallback sempre rode.
+        if content.ocr_used:
+            invoice.confidence_score = 0.0
+            invoice.confidence_score_initial = 0.0
+
         logger.info(
             f"Extração — "
             f"method={invoice.parsing_method.value} | "
             f"tipo={invoice.tipo_fatura_operacional.value if invoice.tipo_fatura_operacional else 'N/A'} | "
             f"docling_fields={len(prefilled)} | "
+            f"ocr={content.ocr_used} | "
             f"confidence={invoice.confidence_score:.2f} | "
             f"número={invoice.invoice_number} | "
             f"total={invoice.total}"
@@ -176,6 +184,22 @@ class FaturaPipeline:
         # 5. LLM fallback (somente se necessário)
         if invoice.confidence_score < _CONFIDENCE_THRESHOLD:
             missing = get_missing_required_fields(invoice)
+
+            # Documentos OCR: campos podem estar preenchidos com texto degradado.
+            # Força reextração de todos os campos essenciais pelo LLM.
+            if content.ocr_used and self._llm.enabled:
+                _ocr_reextract = [
+                    "invoice_number — número da fatura/nota fiscal",
+                    "supplier_name — nome/razão social do emitente",
+                    "supplier_cnpj — CNPJ do emitente",
+                    "customer_name — nome/razão social do destinatário",
+                    "customer_cnpj — CNPJ do destinatário",
+                    "total — valor total da fatura",
+                    "issue_date — data de emissão (formato YYYY-MM-DD)",
+                    "due_date — data de vencimento (formato YYYY-MM-DD)",
+                ]
+                missing = list({*missing, *_ocr_reextract})
+
             if missing and self._llm.enabled:
                 invoice = self._llm.enrich(invoice, missing, content=content)
                 invoice.confidence_score = calculate_confidence(invoice)
