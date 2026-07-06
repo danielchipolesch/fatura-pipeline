@@ -8,8 +8,15 @@ Além do texto plano e tabelas (mantidos para compatibilidade), extrai:
   - page_texts   : {número_página → texto} para escopo de extração regional
   - spatial_index: elementos com bounding boxes para busca por proximidade visual
 
-Configurado para rodar em CPU sem GPU. Usa Tesseract (idioma português) como
-motor de OCR — mais estável em CPU que o motor padrão (RapidOCR/torch).
+Configurado para rodar em CPU sem GPU.
+
+Backends de OCR (selecionável via DOCLING_OCR_BACKEND):
+  rapidocr  — RapidOCR/ONNX (padrão): mais leve que EasyOCR, não requer PyTorch,
+              melhor qualidade que Tesseract para documentos complexos.
+              Requer: rapidocr-onnxruntime
+  tesseract — TesseractCLI: motor tradicional, sempre disponível via apt.
+              Requer: tesseract-ocr + tesseract-ocr-por (pacotes do sistema)
+  auto      — tenta RapidOCR primeiro; cai para Tesseract se não instalado.
 
 Estratégia de OCR "auto" (padrão): a primeira tentativa de conversão é sempre
 sem OCR (rápida). Se o texto extraído for muito curto em relação ao número de
@@ -31,6 +38,16 @@ from loguru import logger
 from docling.datamodel.base_models import ConversionStatus, InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, TesseractCliOcrOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
+
+# RapidOCR: backend ONNX leve, sem GPU, melhor qualidade que Tesseract em documentos
+# complexos. Importado opcionalmente para não bloquear se rapidocr-onnxruntime não estiver
+# instalado (fallback transparente para Tesseract).
+try:
+    from docling.datamodel.pipeline_options import RapidOcrOptions as _RapidOcrOptions
+    _RAPIDOCR_AVAILABLE = True
+except ImportError:
+    _RapidOcrOptions = None  # type: ignore[assignment,misc]
+    _RAPIDOCR_AVAILABLE = False
 
 # Imports opcionais do docling-core (tipagem rica de elementos do documento).
 # Presentes em docling>=2.x via pacote docling-core, mas protegidos por try/except
@@ -78,7 +95,7 @@ class DocumentContent:
       tables       — DataFrames das tabelas detectadas
       page_count   — número de páginas
       source_path  — caminho absoluto do PDF original
-      ocr_used     — True se OCR (Tesseract) foi aplicado
+      ocr_used     — True se OCR foi aplicado (backend: rapidocr ou tesseract)
 
     Campos de estrutura semântica (novos, podem ficar vazios em casos extremos):
       section_map    — {NOME_SEÇÃO (uppercase) → texto_do_bloco}
@@ -133,9 +150,14 @@ class DoclingLoader:
 
         ocr_lang = os.getenv("DOCLING_OCR_LANG", "por").split(",")
 
+        # Backend OCR: "auto" tenta RapidOCR primeiro, cai para Tesseract se ausente.
+        ocr_backend_env = os.getenv("DOCLING_OCR_BACKEND", "auto").lower()
+        self._ocr_backend = self._resolve_ocr_backend(ocr_backend_env)
+
         logger.debug(
             f"DoclingLoader — ocr_mode={self._ocr_mode}, "
-            f"table_structure={enable_table_structure}, ocr_lang={ocr_lang}"
+            f"table_structure={enable_table_structure}, ocr_lang={ocr_lang}, "
+            f"ocr_backend={self._ocr_backend}"
         )
 
         # Conversor rápido (sem OCR) — usado sempre como primeira tentativa
@@ -149,13 +171,53 @@ class DoclingLoader:
         # Conversor com OCR — instanciado apenas se ocr_mode != "never"
         self._converter_ocr: DocumentConverter | None = None
         if self._ocr_mode != "never":
-            ocr_options = PdfPipelineOptions()
-            ocr_options.do_ocr = True
-            ocr_options.ocr_options = TesseractCliOcrOptions(lang=ocr_lang)
-            ocr_options.do_table_structure = enable_table_structure
+            ocr_pipe_opts = PdfPipelineOptions()
+            ocr_pipe_opts.do_ocr = True
+            ocr_pipe_opts.do_table_structure = enable_table_structure
+            ocr_pipe_opts.ocr_options = self._build_ocr_options(self._ocr_backend, ocr_lang)
             self._converter_ocr = DocumentConverter(
-                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=ocr_options)}
+                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=ocr_pipe_opts)}
             )
+
+    # ------------------------------------------------------------------
+    # Resolução e construção do backend OCR
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_ocr_backend(requested: str) -> str:
+        """
+        Determina o backend OCR efetivo.
+
+        "auto"     → rapidocr se disponível, senão tesseract
+        "rapidocr" → rapidocr (lança erro em runtime se não instalado)
+        "tesseract" → tesseract (sempre disponível se tesseract-ocr estiver no sistema)
+        """
+        if requested == "rapidocr":
+            return "rapidocr"
+        if requested == "tesseract":
+            return "tesseract"
+        # "auto": prefere RapidOCR pois é mais leve (ONNX) e com melhor qualidade
+        if _RAPIDOCR_AVAILABLE:
+            return "rapidocr"
+        logger.info(
+            "DOCLING_OCR_BACKEND=auto: rapidocr-onnxruntime não instalado — "
+            "usando Tesseract como fallback. "
+            "Para ativar RapidOCR: pip install rapidocr-onnxruntime"
+        )
+        return "tesseract"
+
+    @staticmethod
+    def _build_ocr_options(backend: str, tesseract_lang: list[str]):
+        """Constrói o objeto de opções OCR adequado para o backend escolhido."""
+        if backend == "rapidocr":
+            if not _RAPIDOCR_AVAILABLE or _RapidOcrOptions is None:
+                raise RuntimeError(
+                    "Backend OCR 'rapidocr' selecionado mas rapidocr-onnxruntime "
+                    "não está instalado. Execute: pip install rapidocr-onnxruntime"
+                )
+            return _RapidOcrOptions()
+        # tesseract (padrão de segurança)
+        return TesseractCliOcrOptions(lang=tesseract_lang)
 
     # ------------------------------------------------------------------
     # API pública — single file
@@ -185,7 +247,7 @@ class DoclingLoader:
         if needs_ocr:
             logger.info(
                 f"{pdf_path.name}: texto insuficiente ({len(content.full_text)} chars / "
-                f"{content.page_count} pág) — reprocessando com OCR (Tesseract/por)..."
+                f"{content.page_count} pág) — reprocessando com OCR ({self._ocr_backend})..."
             )
             result_ocr = self._converter_ocr.convert(str(pdf_path))
             content = self._enrich(result_ocr, ocr_used=True)

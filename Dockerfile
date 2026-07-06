@@ -34,6 +34,10 @@ opts.do_ocr = False; \
 opts.do_table_structure = True; \
 print('Docling models ready')" || echo "Model pre-warm skipped, will download at runtime"
 
+# Pre-warm RapidOCR models (ONNX) at build time — dois passos com fallback
+RUN python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR(); print('RapidOCR ready')" \
+    || echo "RapidOCR pre-warm skipped, will initialize at runtime"
+
 COPY src/ ./src/
 
 RUN mkdir -p /app/input /app/output /app/logs
