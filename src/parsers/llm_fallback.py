@@ -75,8 +75,10 @@ não se limite apenas aos prioritários:
 - total: number (valor total a pagar)
 - payment_method: string (forma de pagamento, ex: boleto, PIX, débito automático)
 - payment_terms: string (condições de pagamento)
-- line_items: lista de objetos {{"description": string, "quantity": number, "unit_price": number, "total": number}}
-  com os principais itens/serviços da fatura (no máximo 5 itens, os mais relevantes)
+- line_items: lista de objetos {{"description": string, "quantity": number, "unit": string, "unit_price": number, "total": number}}
+  com os componentes da fatura de energia (TUSD, Tarifa de Energia, Demanda Ponta/Fora Ponta,
+  ICMS, PIS, COFINS, etc.) ou itens/serviços de nota fiscal; até 10 itens, sem omitir nenhum
+- consumer_unit: string (código da unidade consumidora / código de instalação / número do ponto de entrega)
 
 {context_section}Texto da fatura (até 6000 caracteres):
 ---
@@ -298,9 +300,15 @@ class LLMFallback:
 
 _SUPPLIER_FIELDS = {"supplier_name", "supplier_cnpj", "supplier_cpf", "supplier_city", "supplier_state"}
 _CUSTOMER_FIELDS = {"customer_name", "customer_cnpj", "customer_cpf", "customer_city", "customer_state"}
+_ENERGY_FIELDS   = {"consumer_unit", "line_items"}
 
 _SUPPLIER_SECTION_KEYS = {"emitente", "fornecedor", "remetente", "vendedor", "prestador"}
 _CUSTOMER_SECTION_KEYS = {"destinatario", "destinatário", "cliente", "tomador", "comprador"}
+_ENERGY_SECTION_KEYS   = {
+    "itens", "fatura", "cobranca", "cobrança", "consumo", "energia",
+    "discriminacao", "discriminação", "composicao", "composição",
+    "unidade consumidora", "instalacao", "instalação",
+}
 
 
 def _build_section_context(missing_fields: list[str], content) -> str:
@@ -319,6 +327,7 @@ def _build_section_context(missing_fields: list[str], content) -> str:
 
     need_supplier = bool(missing_set & _SUPPLIER_FIELDS)
     need_customer = bool(missing_set & _CUSTOMER_FIELDS)
+    need_energy   = bool(missing_set & _ENERGY_FIELDS)
 
     for section_name, section_text in section_map.items():
         key = section_name.lower().strip()
@@ -329,6 +338,8 @@ def _build_section_context(missing_fields: list[str], content) -> str:
             sections_needed.append(f"[{section_name}]\n{section_text[:800]}")
         elif need_customer and any(k in key for k in _CUSTOMER_SECTION_KEYS):
             sections_needed.append(f"[{section_name}]\n{section_text[:800]}")
+        elif need_energy and any(k in key for k in _ENERGY_SECTION_KEYS):
+            sections_needed.append(f"[{section_name}]\n{section_text[:1200]}")
 
     if not sections_needed:
         return ""
@@ -412,7 +423,16 @@ def _merge(invoice: Invoice, data: dict) -> Invoice:
     if not invoice.customer.address.state and data.get("customer_state"):
         invoice.customer.address.state = str(data["customer_state"])
 
-    # Itens de fatura — só complementa se o parser determinístico não achou nenhum
+    # Itens de fatura — substitui se o parser determinístico só encontrou itens
+    # sem nenhum dado quantitativo (sinal de lixo de OCR), ou complementa se vazio
+    if invoice.line_items and isinstance(data.get("line_items"), list) and data["line_items"]:
+        all_empty = all(
+            item.quantity is None and item.unit_price is None and item.total is None
+            for item in invoice.line_items
+        )
+        if all_empty:
+            invoice.line_items = []  # descarta lixo de OCR para dar lugar ao LLM
+
     if not invoice.line_items and isinstance(data.get("line_items"), list):
         for raw_item in data["line_items"][:10]:
             if not isinstance(raw_item, dict) or not raw_item.get("description"):
@@ -420,10 +440,15 @@ def _merge(invoice: Invoice, data: dict) -> Invoice:
             invoice.line_items.append(
                 LineItem(
                     description=str(raw_item["description"])[:300],
+                    unit=str(raw_item["unit"])[:20] if raw_item.get("unit") else None,
                     quantity=_as_float(raw_item.get("quantity")),
                     unit_price=_as_float(raw_item.get("unit_price")),
                     total=_as_float(raw_item.get("total")),
                 )
             )
+
+    # Unidade consumidora (código de instalação/ponto de entrega)
+    if not invoice.energy.consumer_unit and data.get("consumer_unit"):
+        invoice.energy.consumer_unit = str(data["consumer_unit"])
 
     return invoice

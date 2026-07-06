@@ -197,6 +197,8 @@ class FaturaPipeline:
                     "total — valor total da fatura",
                     "issue_date — data de emissão (formato YYYY-MM-DD)",
                     "due_date — data de vencimento (formato YYYY-MM-DD)",
+                    "consumer_unit — código da unidade consumidora (instalação/UC)",
+                    "line_items — componentes/itens da fatura (TUSD, TE, demanda, impostos, etc.)",
                 ]
                 missing = list({*missing, *_ocr_reextract})
 
