@@ -23,9 +23,11 @@ from loguru import logger
 from src.extractors.fields import (
     extract_br_state,
     extract_cnpj,
+    extract_consumer_unit,
     extract_date,
     parse_currency,
 )
+from src.extractors.tables import extract_line_items_from_tables
 from src.models.invoice import InvoiceLayout
 from src.parsers.docling_loader import DocumentContent, SpatialElement
 
@@ -55,6 +57,13 @@ _KV_CITY = [
 ]
 _KV_STATE = [
     "u.f.", "uf", "estado",
+]
+_KV_CONSUMER_UNIT = [
+    "unidade consumidora", "unid. consumidora",
+    "instalacao", "instalação", "n. instalacao", "n. da instalacao",
+    "cod. instalacao", "cod. instalação", "codigo instalacao",
+    "ponto de entrega", "pde",
+    "uc",
 ]
 
 # ---------------------------------------------------------------------------
@@ -88,6 +97,16 @@ _SECTIONS_CUSTOMER = [
     "CONSUMIDOR",
     "CLIENTE",
     "UNIDADE CONSUMIDORA",
+]
+_SECTIONS_ADDITIONAL = [
+    "INFORMAÇÕES ADICIONAIS",
+    "INFORMAÇÕES ADICIONAIS DO FISCO",
+    "INFORMAÇÕES COMPLEMENTARES",
+    "DADOS ADICIONAIS",
+    "OBSERVAÇÕES",
+    "OBS",
+    "COMPLEMENTO",
+    "INFORMAÇÕES",
 ]
 
 # Linha de ruído: só labels, só números, e-mail avulso, CEP, etc.
@@ -128,6 +147,7 @@ class DoclingExtractor:
         self._from_sections(content, result)
         self._from_spatial(content, layout, result)
         self._from_page_texts(content, layout, result)
+        self._from_tables(content, result)
 
         n = len(result)
         logger.debug(
@@ -185,6 +205,12 @@ class DoclingExtractor:
                 v = value_stripped.upper()
                 if v not in state_list:
                     state_list.append(v)
+
+            if "consumer_unit" not in result and _kv_matches(key_lower, _KV_CONSUMER_UNIT):
+                # Aceita valor que contenha ao menos 4 dígitos (código numérico de UC)
+                import re as _re
+                if value_stripped and len(_re.sub(r"[^\d]", "", value_stripped)) >= 4:
+                    result["consumer_unit"] = value_stripped
 
         # Heurística de ordem: 1ª ocorrência = supplier, 2ª = customer
         if cnpj_list and "supplier_cnpj" not in result:
@@ -262,6 +288,15 @@ class DoclingExtractor:
             if state and "customer_state" not in result:
                 result["customer_state"] = state
 
+        # Consumer unit — NF-e de comercializadora tipicamente registra o código
+        # da instalação/ponto de entrega nas "INFORMAÇÕES ADICIONAIS".
+        if "consumer_unit" not in result:
+            add_text = _get_section_text(content.section_map, _SECTIONS_ADDITIONAL)
+            if add_text:
+                cu = extract_consumer_unit(add_text)
+                if cu:
+                    result["consumer_unit"] = cu
+
     # ------------------------------------------------------------------
     # 3. Extração via spatial_index (proximidade visual — bounding boxes)
     # ------------------------------------------------------------------
@@ -328,6 +363,23 @@ class DoclingExtractor:
                         result["issue_date"] = d
                         break
 
+        # Consumer unit via âncora espacial
+        if "consumer_unit" not in result:
+            uc_labels = [
+                r"PONTO\s+DE\s+ENTREGA",
+                r"UNID(?:ADE)?\.?\s*CONSUMIDORA",
+                r"C[ÓO]D(?:IGO)?\.?\s*INSTALA[ÇC][ÃA]O",
+                r"N[ºo°]\.?\s*(?:DA\s+)?INSTALA[ÇC][ÃA]O",
+            ]
+            for label_pattern in uc_labels:
+                val_text = _spatial_right_or_below(
+                    content.spatial_index, label_pattern,
+                    value_pattern=r"[\d][\d.\-/]*",
+                )
+                if val_text and len(re.sub(r"[^\d]", "", val_text)) >= 4:
+                    result["consumer_unit"] = val_text
+                    break
+
     # ------------------------------------------------------------------
     # 4. Extração via page_texts (regex scoped por página)
     # ------------------------------------------------------------------
@@ -359,6 +411,18 @@ class DoclingExtractor:
                     val = m.group(1).strip()
                     if val and val not in ("0", ""):
                         result["invoice_number"] = val
+
+
+    # ------------------------------------------------------------------
+    # 5. Extração de itens via tabelas Docling
+    # ------------------------------------------------------------------
+
+    def _from_tables(self, content: DocumentContent, result: dict) -> None:
+        if not content.tables or "line_items" in result:
+            return
+        items = extract_line_items_from_tables(content.tables)
+        if items:
+            result["line_items"] = items
 
 
 # ---------------------------------------------------------------------------

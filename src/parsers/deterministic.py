@@ -69,6 +69,7 @@ from src.models.invoice import (
     READ_ERROR_SENTINEL,
     Tax,
 )
+from src.extractors.tables import extract_line_items_from_tables as _extract_line_items_from_tables
 from src.parsers.docling_loader import DocumentContent
 
 # ---------------------------------------------------------------------------
@@ -520,116 +521,6 @@ class _FieldExtractor:
 # Extração de itens de tabela
 # ---------------------------------------------------------------------------
 
-def _extract_line_items_from_tables(tables: list[pd.DataFrame]) -> list[LineItem]:
-    """
-    Percorre os DataFrames extraídos pelo docling em busca de tabelas de itens.
-    Identifica a tabela de produtos/serviços pelo padrão das colunas.
-    """
-    items: list[LineItem] = []
-
-    desc_aliases = {"descri", "produto", "servi", "item", "discrimina", "histor"}
-    qty_aliases = {"qtd", "quant", "qty", "amount"}
-    price_aliases = {"unit", "pre", "price", "valor unit"}
-    total_aliases = {"total", "valor total", "vlr total", "subtotal"}
-
-    def _col_match(col_name: str, aliases: set[str]) -> bool:
-        normalized = str(col_name).lower().strip()
-        return any(a in normalized for a in aliases)
-
-    for df in tables:
-        cols = list(df.columns)
-        col_str = " ".join(str(c).lower() for c in cols)
-
-        # Heurística: tabela de itens tem coluna de descrição + pelo menos mais 1 coluna de valor
-        has_desc = any(_col_match(c, desc_aliases) for c in cols)
-        has_value = any(_col_match(c, price_aliases | total_aliases) for c in cols)
-
-        if not (has_desc or (has_value and len(cols) >= 3)):
-            continue
-
-        desc_col = next((c for c in cols if _col_match(c, desc_aliases)), cols[0])
-        qty_col = next((c for c in cols if _col_match(c, qty_aliases)), None)
-        price_col = next((c for c in cols if _col_match(c, price_aliases)), None)
-        total_col = next((c for c in cols if _col_match(c, total_aliases)), None)
-
-        # Padrões de linhas de ruído que não são itens reais
-        _noise = re.compile(
-            r"^(TOTAL|SUBTOTAL|HISTÓRICO|HISTÓRIA|MÊS|ANO|UF|HP|HFP|HR|\d{1,2}/\d{2,4}|"
-            r"OUT|SET|AGO|JUL|JUN|MAI|ABR|MAR|FEV|JAN|DEZ|NOV|$)",
-            re.IGNORECASE,
-        )
-
-        for _, row in df.iterrows():
-            desc_val = str(row.get(desc_col, "")).strip()
-            if not desc_val or desc_val.lower() in ("nan", "none", ""):
-                continue
-            if _noise.match(desc_val):
-                continue
-            # Itens puramente numéricos não são descrições
-            if re.match(r"^[\d.,\s]+$", desc_val):
-                continue
-
-            qty = None
-            if qty_col and str(row.get(qty_col, "")).strip():
-                try:
-                    qty = parse_currency(str(row[qty_col]))
-                except Exception:
-                    pass
-
-            # Fallback 1: Docling às vezes inverte header/dado em tabelas NF-e
-            # (ex: o valor numérico da quantidade fica no nome da coluna, não
-            # na célula). Detecta pelo fato de qty_col ser "QUANT..." mas ter
-            # valor não-numérico na célula → tenta parse do próprio nome.
-            if qty is None and qty_col and _col_match(str(qty_col), qty_aliases):
-                candidate = parse_currency(str(qty_col))
-                # Aceita apenas se o valor for plausível para uma quantidade
-                # (> 0 e < 1.000.000) e o nome der um float razoável
-                if candidate is not None and 0 < candidate < 1_000_000:
-                    qty = candidate
-
-            # Fallback 2: "V.TOTAL/V.UNITARIO <qty>" no nome de outra coluna.
-            # Docling às vezes desloca o valor para o nome da coluna de total/
-            # unitário — ex: coluna "V.TOTAL 259,3100" com valor real=40.299,37.
-            if qty is None:
-                for col in cols:
-                    m_emb = re.search(
-                        r"\bV\.?\s*(?:TOTAL|UNIT(?:ARIO)?)\s+([\d]{1,6}[.,][\d]+)\s*$",
-                        str(col), re.IGNORECASE,
-                    )
-                    if m_emb:
-                        candidate = parse_currency(m_emb.group(1))
-                        if candidate is not None and 0 < candidate < 1_000_000:
-                            qty = candidate
-                            break
-
-            # Unidade de medida: coluna "UN"/"UNID"/"UNIDADE" etc.
-            un_col = next(
-                (c for c in cols if str(c).strip().upper() in ("UN", "UNID", "UNIDADE", "UNIT", "UND")),
-                None,
-            )
-            unit_val_str = str(row.get(un_col, "")).strip() if un_col else ""
-            unit = unit_val_str if unit_val_str and unit_val_str.lower() not in ("nan", "none") else None
-
-            unit_price = None
-            if price_col and str(row.get(price_col, "")).strip():
-                unit_price = parse_currency(str(row[price_col]))
-
-            total_val = None
-            if total_col and str(row.get(total_col, "")).strip():
-                total_val = parse_currency(str(row[total_col]))
-
-            items.append(
-                LineItem(
-                    description=desc_val,
-                    unit=unit,
-                    quantity=qty,
-                    unit_price=unit_price,
-                    total=total_val,
-                )
-            )
-
-    return items
-
 
 def _extract_line_items_from_text(text: str, layout: InvoiceLayout) -> list[LineItem]:
     """
@@ -851,7 +742,12 @@ class DeterministicParser:
                             supplier.address.state = known_nfe.get("state")
 
         # -- Itens --
-        line_items = _extract_line_items_from_tables(content.tables)
+        # DoclingExtractor pode ter extraído itens estruturados da tabela Docling
+        # (camada primária); só executa extração própria se não foram preenchidos.
+        line_items = (
+            pre.get("line_items")
+            or _extract_line_items_from_tables(content.tables)
+        )
         if not line_items:
             line_items = _extract_line_items_from_text(text, layout)
 
@@ -926,7 +822,7 @@ class DeterministicParser:
         # potência), o campo correspondente fica null — ausência confirmada,
         # não falha de extração. Ver EnergyMetrics para detalhes de cada campo.
         energy = EnergyMetrics(
-            consumer_unit=extract_consumer_unit(text),
+            consumer_unit=pre.get("consumer_unit") or extract_consumer_unit(text),
             client_number=extract_client_number(text),
             measured_demand_offpeak_kw=extract_measured_demand_kw(text),
             demand_overage_value=extract_demand_overage_value(text),
