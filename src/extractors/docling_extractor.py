@@ -30,6 +30,7 @@ from src.extractors.fields import (
 from src.extractors.tables import extract_line_items_from_tables
 from src.extractors.taxes import (
     SECTIONS_TAX,
+    build_taxes,
     extract_taxes_from_kv_pairs,
     extract_taxes_from_section_text,
     extract_taxes_from_tables,
@@ -396,6 +397,43 @@ class DoclingExtractor:
                     result["consumer_unit"] = val_text
                     break
 
+        # Impostos via âncora espacial — funciona quando labels e valores estão
+        # lado a lado no layout (DANFE NF3E, boleto com tabela de ICMS/PIS/COFINS).
+        # Prioridade: "V. DO ICMS" (específico) antes de "ICMS" genérico para
+        # não confundir com labels de coluna de detalhe (ex: "ICMS por componente").
+        if "taxes" not in result:
+            _TAX_SPATIAL = {
+                "ICMS": [
+                    r"V(?:ALOR)?\.?\s*DO\s+ICMS\b",
+                    r"TOTAL\s+ICMS\b",
+                    r"\bICMS\b(?!\s*(?:ST\b|BASE\b|RET\b|RETID\b|RETENC))",
+                ],
+                "PIS": [
+                    r"V(?:ALOR)?\.?\s*(?:TOTAL\s+)?PIS\b",
+                    r"\bPIS/PASEP\b",
+                    r"\bPIS\b",
+                ],
+                "COFINS": [
+                    r"V(?:ALOR)?\.?\s*(?:TOTAL\s+)?(?:D[AO]\s+)?COFINS\b",
+                    r"\bCOFINS\b",
+                ],
+            }
+            _MONEY_PAT = r"\d[\d.,]*[.,]\d\d"
+            tax_spatial: dict = {}
+            for tax_name, patterns in _TAX_SPATIAL.items():
+                for pat in patterns:
+                    val_text = _spatial_right_or_below(
+                        content.spatial_index, pat,
+                        value_pattern=_MONEY_PAT,
+                    )
+                    if val_text is not None:
+                        v = parse_currency(val_text)
+                        if v is not None and v >= 0:
+                            tax_spatial[tax_name] = {"amount": v}
+                            break
+            if tax_spatial:
+                result["taxes"] = build_taxes(tax_spatial)
+
     # ------------------------------------------------------------------
     # 4. Extração via page_texts (regex scoped por página)
     # ------------------------------------------------------------------
@@ -460,6 +498,23 @@ class DoclingExtractor:
             taxes = extract_taxes_from_tables(content.tables)
             if taxes:
                 result["taxes"] = taxes
+                return
+
+        # Estratégia 3: varre TODAS as seções em busca de conteúdo tributário.
+        # Necessário quando Docling nomeia seções com títulos não-fiscais
+        # (ex: número de boleto como título de seção no boleto Light 376993.pdf,
+        #  ou "NOTA FISCAL Nº..." na NF3E da RGE SUL 141846706.pdf).
+        if content.section_map:
+            _TAX_KW = ("ICMS", "PIS", "COFINS", "TRIBUTO")
+            for sec_text in content.section_map.values():
+                if len(sec_text) < 30:
+                    continue
+                sec_up = sec_text.upper()
+                if any(k in sec_up for k in _TAX_KW):
+                    taxes = extract_taxes_from_section_text(sec_text)
+                    if taxes:
+                        result["taxes"] = taxes
+                        return
 
 
 # ---------------------------------------------------------------------------

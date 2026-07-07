@@ -321,24 +321,30 @@ def extract_taxes_from_section_text(text: str) -> List[Tax]:
     if not tax_names_present:
         return []
 
+    # Padrão de número monetário: aceita com e sem separador de milhar
+    # Ex: "37.971,43", "37971,43", "12260,99" — todos válidos
+    _MONEY = r"\d[\d.,]*[.,]\d\d"
+
     # Para cada imposto encontrado, tenta extrair base/alíquota/valor
     for tax_name in set(tax_names_present):
         tax_key = tax_name.lower()
 
-        # Base de cálculo: número após "base" ou "bc" em sequência
+        # Base de cálculo: número após "base" (janela ampliada para layouts sem
+        # separador de milhar, ex: "Base Caíc. 106774,93")
         base_m = re.search(
-            r"base[^\d]{0,30}([\d]{1,3}(?:[.,]\d{3})*[.,]\d{2})",
+            rf"base[^\d]{{0,50}}({_MONEY})",
             text, re.IGNORECASE,
         )
-        # Alíquota: número < 100 seguido de "%" ou após "alíquota"
+        # Alíquota: número < 100 após "alíquota" ou antes de "%"
         rate_m = re.search(
-            r"al[ií]quota[^\d]{0,20}([\d]{1,2}[.,]\d{1,4})|(\d{1,2}[.,]\d{1,4})\s*%",
+            r"al[ií]quota[^\d]{0,20}(\d{1,2}[.,]\d{1,4})|(\d{1,2}[.,]\d{1,4})\s*%",
             text, re.IGNORECASE,
         )
-        # Valor do imposto: número após padrão "valor do <imposto>" ou "<imposto>" isolado
+        # Valor do imposto: "valor do <imposto>" OU "<imposto> <não-dígitos>{0,20} <número>"
+        # Janela 0,20 cobre "ICMS (RS) valor" (padrão Light boleto)
         amount_m = re.search(
-            rf"valor\s+d[ao]\s+{tax_key}[^\d]{{0,20}}([\d]{{1,3}}(?:[.,]\d{{3}})*[.,]\d{{2}})"
-            rf"|{tax_key}[^\d]{{0,10}}([\d]{{1,3}}(?:[.,]\d{{3}})*[.,]\d{{2}})",
+            rf"valor\s+d[ao]\s+{tax_key}[^\d]{{0,25}}({_MONEY})"
+            rf"|{tax_key}[^\d]{{0,20}}({_MONEY})",
             text, re.IGNORECASE,
         )
 
@@ -353,7 +359,7 @@ def extract_taxes_from_section_text(text: str) -> List[Tax]:
                 bucket["rate"] = v
         if amount_m:
             v = _safe_parse(amount_m.group(1) or amount_m.group(2))
-            if v and v > 0:
+            if v is not None and v >= 0:  # permite 0 (isento/diferido)
                 bucket["amount"] = v
 
         if bucket:
@@ -378,6 +384,11 @@ def _buckets_to_taxes(buckets: Dict[str, Dict]) -> List[Tax]:
             amount=data.get("amount"),
         ))
     return taxes
+
+
+def build_taxes(buckets: Dict[str, Dict]) -> List[Tax]:
+    """Constrói lista de Tax a partir de {nome: {base, rate, amount}}."""
+    return _buckets_to_taxes(buckets)
 
 
 def _dedupe(taxes: List[Tax]) -> List[Tax]:
