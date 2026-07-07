@@ -40,10 +40,11 @@ _TAX_CANONICAL: List[Tuple[str, str]] = [
 
 _BASE_WORDS = {"base", "bc", "base de calculo", "base calc", "base do", "base icms"}
 _RATE_WORDS = {"aliquota", "aliq", "taxa", "percentual", "%"}
-_AMOUNT_WORDS = {"valor do", "valor da", "montante", "valor icms", "vlr icms"}
+_AMOUNT_WORDS = {"valor do", "valor da", "valor total", "montante", "valor icms", "vlr icms"}
 
 # Seções que tipicamente contêm dados de impostos
 SECTIONS_TAX = [
+    "CÁLCULO DO IMPOSTO", "CALCULO DO IMPOSTO",   # seção padrão do DANFE NF-e
     "CÁLCULO DO ICMS", "CALCULO DO ICMS",
     "BASE DE CÁLCULO", "BASE DE CALCULO",
     "TRIBUTAÇÃO", "TRIBUTACAO",
