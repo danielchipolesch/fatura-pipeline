@@ -298,6 +298,64 @@ def _try_column_based(df: pd.DataFrame, cols: List[str]) -> List[Tax]:
 # 3. Extração via texto de seção (fallback semântico)
 # ---------------------------------------------------------------------------
 
+def _extract_by_calculation(text: str) -> List[Tax]:
+    """
+    Encontra triplas (base, alíquota, valor) matematicamente consistentes
+    (valor ≈ base × alíquota / 100) e associa ao imposto pelo label mais
+    próximo no texto.
+
+    Resolve layouts DANFE NF3E onde os valores aparecem ANTES do label —
+    ex: RGE SUL 141846706.pdf tem "223.361,36 / 17,00 / 37.971,43 [...] ICMS".
+    Suporta triplas não-consecutivas (janela de até 6 tokens entre base e valor)
+    para capturar PIS e COFINS em layouts como "base ... rate_pis rate_cofins
+    ... total_pis total_cofins".
+    """
+    _MONEY_RE = re.compile(r"\b(\d[\d.,]*[.,]\d\d)\b")
+    tokens = [(m.start(), _safe_parse(m.group(1))) for m in _MONEY_RE.finditer(text)]
+    tokens = [(pos, v) for pos, v in tokens if v is not None]
+
+    found: Dict[str, Tax] = {}
+    _WINDOW = 6  # máx. tokens entre base e alíquota (e entre alíquota e valor)
+
+    for i, (pos_b, base_v) in enumerate(tokens):
+        if base_v <= 100:
+            continue  # base deve ser > 100 (não é alíquota)
+
+        for j in range(i + 1, min(i + 1 + _WINDOW, len(tokens))):
+            pos_r, rate_v = tokens[j]
+            if not (0 < rate_v < 100):
+                continue
+
+            expected = base_v * rate_v / 100
+            if expected <= 0:
+                continue
+
+            for k in range(j + 1, min(j + 1 + _WINDOW, len(tokens))):
+                pos_a, amount_v = tokens[k]
+                if expected == 0:
+                    continue
+                error = abs(amount_v - expected) / expected
+                if error > 0.02:  # tolerância 2 % (arredondamentos)
+                    continue
+
+                # Tripla válida — identifica imposto pelo label próximo no texto
+                ctx_start = max(0, pos_b - 150)
+                ctx_end = min(len(text), pos_a + 300)
+                context = text[ctx_start:ctx_end].upper()
+
+                for key, canonical in _TAX_CANONICAL:
+                    if canonical not in found and key.upper() in context:
+                        found[canonical] = Tax(
+                            name=canonical,
+                            base=base_v,
+                            rate=rate_v,
+                            amount=amount_v,
+                        )
+                        break  # imposto identificado; próxima tripla
+
+    return list(found.values())
+
+
 def extract_taxes_from_section_text(text: str) -> List[Tax]:
     """
     Extrai impostos do texto de uma seção identificada semanticamente pelo
@@ -305,48 +363,86 @@ def extract_taxes_from_section_text(text: str) -> List[Tax]:
     mais seguro que busca global porque o texto já foi selecionado pelo modelo
     de layout do Docling.
 
-    Detecta padrões:
-      • BASE: número > 1000 logo após label "base"/"bc"
-      • ALÍQUOTA: número < 100 logo após label "aliq"/"%" ou seguido de "%"
-      • VALOR DO ICMS: número após label de valor + "icms"
+    Estratégia A — label → valor: regex busca label seguido de número.
+      Melhorias vs abordagem simples:
+        • Detecção de nomes usa \b (evita "iss" em "em**iss**ao", "pis" em "piso")
+        • Alíquota: prefere "aliquota + número" antes de "número%" — evita capturar
+          percentual de reajuste tarifário que aparece antes da tabela de ICMS
+        • Valor: padrão com dois números (quando o primeiro ≤ 100 é alíquota, usa o
+          segundo como valor) — resolve "ICMS Aliquota 24,000 2942,64" → 2942.64
+    Estratégia B — cálculo matemático: encontra triplas (base × aliq/100 ≈ valor)
+      mesmo quando os valores aparecem ANTES do label (ex: DANFE NF3E RGE SUL).
+    A estratégia B substitui a A quando encontra resultado mais completo.
     """
     buckets: Dict[str, Dict] = {}
-    text_n = _norm(text)
 
-    # Detecta qual imposto aparece no texto
-    tax_names_present = []
+    # Padrão de número monetário: aceita 2-4 casas decimais, sem dígito seguinte.
+    # "37.971,43" ✓  "24,000" ✓ (alíquota com 3 zeros)  "0,28537" ✗ (5 decimais)
+    _MONEY = r"\d[\d.,]*[.,]\d{2,4}(?!\d)"
+
+    # Detecta quais impostos aparecem no texto usando \b para evitar falsos
+    # positivos por substring (ex: "iss" em "emissão", "pis" em "piso").
+    tax_names_present: List[str] = []
+    seen_canonical: set = set()
     for key, canonical in _TAX_CANONICAL:
-        if key in text_n:
+        if canonical in seen_canonical:
+            continue
+        escaped = re.escape(key)  # "pis/pasep" → "pis\/pasep"
+        if re.search(rf"\b{escaped}\b", text, re.IGNORECASE):
             tax_names_present.append(canonical)
+            seen_canonical.add(canonical)
     if not tax_names_present:
         return []
 
-    # Padrão de número monetário: aceita com e sem separador de milhar
-    # Ex: "37.971,43", "37971,43", "12260,99" — todos válidos
-    _MONEY = r"\d[\d.,]*[.,]\d\d"
-
-    # Para cada imposto encontrado, tenta extrair base/alíquota/valor
-    for tax_name in set(tax_names_present):
+    # Estratégia A: label → valor (regex com limites de palavra)
+    for tax_name in tax_names_present:
         tax_key = tax_name.lower()
+        _tk = re.escape(tax_key)
 
-        # Base de cálculo: número após "base" (janela ampliada para layouts sem
-        # separador de milhar, ex: "Base Caíc. 106774,93")
+        # Base: número após "base" (com limite de palavra)
         base_m = re.search(
-            rf"base[^\d]{{0,50}}({_MONEY})",
+            rf"\bbase\b[^\d]{{0,50}}({_MONEY})",
             text, re.IGNORECASE,
         )
-        # Alíquota: número < 100 após "alíquota" ou antes de "%"
-        rate_m = re.search(
-            r"al[ií]quota[^\d]{0,20}(\d{1,2}[.,]\d{1,4})|(\d{1,2}[.,]\d{1,4})\s*%",
+
+        # Alíquota: prefire "alíquota + número" antes de "número %" para evitar
+        # capturar percentuais de contexto (ex: "reajuste tarifário de 13,46%").
+        rate_m = (
+            re.search(r"al[ií]quota[^\d]{0,20}(\d{1,2}[.,]\d{1,4})", text, re.IGNORECASE)
+            or re.search(r"(\d{1,2}[.,]\d{1,4})\s*%", text, re.IGNORECASE)
+        )
+
+        # Valor do imposto — três padrões em ordem de preferência:
+        #   1. "valor do ICMS NN,NN"
+        #   2. dois números após label: se o primeiro ≤ 100 (alíquota?), usa o segundo
+        #      (resolve "ICMS Aliquota 24,000 2942,64" → 2942,64)
+        #   3. um número após label (fallback simples)
+        _amount_val: Optional[float] = None
+        vd_m = re.search(
+            rf"valor\s+d[ao]\s+\b{_tk}\b[^\d]{{0,25}}({_MONEY})",
             text, re.IGNORECASE,
         )
-        # Valor do imposto: "valor do <imposto>" OU "<imposto> <não-dígitos>{0,20} <número>"
-        # Janela 0,20 cobre "ICMS (RS) valor" (padrão Light boleto)
-        amount_m = re.search(
-            rf"valor\s+d[ao]\s+{tax_key}[^\d]{{0,25}}({_MONEY})"
-            rf"|{tax_key}[^\d]{{0,20}}({_MONEY})",
-            text, re.IGNORECASE,
-        )
+        if vd_m:
+            _amount_val = _safe_parse(vd_m.group(1))
+        else:
+            tk2_m = re.search(
+                rf"\b{_tk}\b[^\d]{{0,20}}({_MONEY})[^\d]{{0,30}}({_MONEY})",
+                text, re.IGNORECASE,
+            )
+            if tk2_m:
+                v1 = _safe_parse(tk2_m.group(1))
+                v2 = _safe_parse(tk2_m.group(2))
+                if v1 is not None and v1 <= 100 and v2 is not None and v2 > 0:
+                    _amount_val = v2  # primeiro é alíquota, segundo é o valor
+                else:
+                    _amount_val = v1
+            else:
+                tk1_m = re.search(
+                    rf"\b{_tk}\b[^\d]{{0,20}}({_MONEY})",
+                    text, re.IGNORECASE,
+                )
+                if tk1_m:
+                    _amount_val = _safe_parse(tk1_m.group(1))
 
         bucket: Dict = {}
         if base_m:
@@ -354,16 +450,22 @@ def extract_taxes_from_section_text(text: str) -> List[Tax]:
             if v and v > 0:
                 bucket["base"] = v
         if rate_m:
-            v = _safe_parse(rate_m.group(1) or rate_m.group(2))
+            v = _safe_parse(rate_m.group(1))
             if v and 0 < v < 100:
                 bucket["rate"] = v
-        if amount_m:
-            v = _safe_parse(amount_m.group(1) or amount_m.group(2))
-            if v is not None and v >= 0:  # permite 0 (isento/diferido)
-                bucket["amount"] = v
+        if _amount_val is not None and _amount_val >= 0:
+            bucket["amount"] = _amount_val
 
         if bucket:
             buckets[tax_name] = bucket
+
+    # Estratégia B: cálculo matemático (substitui A quando mais completo)
+    for t in _extract_by_calculation(text):
+        existing = buckets.get(t.name, {})
+        calc_count = sum(1 for v in (t.base, t.rate, t.amount) if v is not None)
+        exist_count = sum(1 for v in existing.values() if v is not None)
+        if calc_count > exist_count:
+            buckets[t.name] = {"base": t.base, "rate": t.rate, "amount": t.amount}
 
     return _buckets_to_taxes(buckets)
 
@@ -376,6 +478,10 @@ def _buckets_to_taxes(buckets: Dict[str, Dict]) -> List[Tax]:
     taxes = []
     for name, data in buckets.items():
         if not data:
+            continue
+        # Descarta entradas com apenas alíquota e sem base/valor — provavelmente ruído
+        # (ex: "iss" detectado em "emissão" e rate matched por "%" de ajuste tarifário)
+        if data.get("amount") is None and data.get("base") is None:
             continue
         taxes.append(Tax(
             name=name,

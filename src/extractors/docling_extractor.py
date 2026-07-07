@@ -305,14 +305,30 @@ class DoclingExtractor:
                 if cu:
                     result["consumer_unit"] = cu
 
-        # Impostos via seção semântica (fallback quando kv_pairs/tabelas não
-        # encontraram os tributos — seção já identificada pelo modelo Docling).
+        # Impostos — estratégia 1: seção explicitamente nomeada (ex: "CÁLCULO DO IMPOSTO")
         if "taxes" not in result:
             tax_text = _get_section_text(content.section_map, SECTIONS_TAX)
             if tax_text:
                 taxes = extract_taxes_from_section_text(tax_text)
                 if taxes:
                     result["taxes"] = taxes
+
+        # Impostos — estratégia 2: varre TODAS as seções com conteúdo tributário.
+        # Roda ANTES da busca espacial (_from_spatial) para evitar que o spatial
+        # popule taxes com valores errados (ex: ICMS base em vez do ICMS total).
+        # Necessário quando Docling nomeia seções com títulos não-fiscais:
+        #   - 376993.pdf: código de barras como título de seção (boleto Light)
+        #   - 141846706.pdf: "NOTA FISCAL Nº..." (DANFE NF3E RGE SUL)
+        if "taxes" not in result:
+            _TAX_KW = ("ICMS", "PIS", "COFINS", "TRIBUTO")
+            for sec_text in content.section_map.values():
+                if len(sec_text) < 30:
+                    continue
+                if any(k in sec_text.upper() for k in _TAX_KW):
+                    taxes = extract_taxes_from_section_text(sec_text)
+                    if taxes:
+                        result["taxes"] = taxes
+                        break
 
     # ------------------------------------------------------------------
     # 3. Extração via spatial_index (proximidade visual — bounding boxes)
@@ -479,7 +495,8 @@ class DoclingExtractor:
             result["line_items"] = items
 
     # ------------------------------------------------------------------
-    # 6. Extração de impostos (kv_pairs → tabelas; seção já feita em _from_sections)
+    # 6. Extração de impostos (kv_pairs → tabelas; seções já cobertas em
+    #    _from_sections; spatial já coberto em _from_spatial)
     # ------------------------------------------------------------------
 
     def _from_taxes(self, content: DocumentContent, result: dict) -> None:
@@ -499,22 +516,6 @@ class DoclingExtractor:
             if taxes:
                 result["taxes"] = taxes
                 return
-
-        # Estratégia 3: varre TODAS as seções em busca de conteúdo tributário.
-        # Necessário quando Docling nomeia seções com títulos não-fiscais
-        # (ex: número de boleto como título de seção no boleto Light 376993.pdf,
-        #  ou "NOTA FISCAL Nº..." na NF3E da RGE SUL 141846706.pdf).
-        if content.section_map:
-            _TAX_KW = ("ICMS", "PIS", "COFINS", "TRIBUTO")
-            for sec_text in content.section_map.values():
-                if len(sec_text) < 30:
-                    continue
-                sec_up = sec_text.upper()
-                if any(k in sec_up for k in _TAX_KW):
-                    taxes = extract_taxes_from_section_text(sec_text)
-                    if taxes:
-                        result["taxes"] = taxes
-                        return
 
 
 # ---------------------------------------------------------------------------
