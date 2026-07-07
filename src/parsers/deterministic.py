@@ -673,7 +673,8 @@ class DeterministicParser:
         # Total: DoclingExtractor via kv_pairs/spatial tem prioridade; labels regex como fallback.
         total = pre.get("total") or ext.total_via_labels(text, layout)
         subtotal = ext.subtotal(text)
-        taxes = ext.taxes(text, layout)
+        # DoclingExtractor (semântico) tem prioridade; regex como fallback.
+        taxes = pre.get("taxes") or ext.taxes(text, layout)
 
         # Fallback de data de vencimento: padrão "DD/MM/AAAA \n R$ valor" sem rótulo,
         # comum quando o rótulo (ex: "VENCIMENTO") é um elemento gráfico não

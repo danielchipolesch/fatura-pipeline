@@ -28,6 +28,12 @@ from src.extractors.fields import (
     parse_currency,
 )
 from src.extractors.tables import extract_line_items_from_tables
+from src.extractors.taxes import (
+    SECTIONS_TAX,
+    extract_taxes_from_kv_pairs,
+    extract_taxes_from_section_text,
+    extract_taxes_from_tables,
+)
 from src.models.invoice import InvoiceLayout
 from src.parsers.docling_loader import DocumentContent, SpatialElement
 
@@ -148,6 +154,7 @@ class DoclingExtractor:
         self._from_spatial(content, layout, result)
         self._from_page_texts(content, layout, result)
         self._from_tables(content, result)
+        self._from_taxes(content, result)
 
         n = len(result)
         logger.debug(
@@ -297,6 +304,15 @@ class DoclingExtractor:
                 if cu:
                     result["consumer_unit"] = cu
 
+        # Impostos via seção semântica (fallback quando kv_pairs/tabelas não
+        # encontraram os tributos — seção já identificada pelo modelo Docling).
+        if "taxes" not in result:
+            tax_text = _get_section_text(content.section_map, SECTIONS_TAX)
+            if tax_text:
+                taxes = extract_taxes_from_section_text(tax_text)
+                if taxes:
+                    result["taxes"] = taxes
+
     # ------------------------------------------------------------------
     # 3. Extração via spatial_index (proximidade visual — bounding boxes)
     # ------------------------------------------------------------------
@@ -423,6 +439,27 @@ class DoclingExtractor:
         items = extract_line_items_from_tables(content.tables)
         if items:
             result["line_items"] = items
+
+    # ------------------------------------------------------------------
+    # 6. Extração de impostos (kv_pairs → tabelas; seção já feita em _from_sections)
+    # ------------------------------------------------------------------
+
+    def _from_taxes(self, content: DocumentContent, result: dict) -> None:
+        if "taxes" in result:
+            return
+
+        # Estratégia 1: kv_pairs — campos como "BASE DE CÁLCULO DO ICMS"
+        if content.kv_pairs:
+            taxes = extract_taxes_from_kv_pairs(content.kv_pairs)
+            if taxes:
+                result["taxes"] = taxes
+                return
+
+        # Estratégia 2: tabelas — linhas ou colunas com estrutura de tributos
+        if content.tables:
+            taxes = extract_taxes_from_tables(content.tables)
+            if taxes:
+                result["taxes"] = taxes
 
 
 # ---------------------------------------------------------------------------
