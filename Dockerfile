@@ -44,7 +44,10 @@ RUN python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR(); print('Rap
 # continua funcionando sem a camada de pré-processamento avançado.
 COPY requirements-scanned.txt .
 RUN pip install --no-cache-dir -r requirements-scanned.txt \
-    && python -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='en'); print('PaddleOCR ready')" \
+    && python -c "\
+from paddleocr import PaddleOCR; \
+ocr = PaddleOCR(); \
+print('PaddleOCR ready')" \
     || echo "PaddleOCR indisponível — pipeline funcionará sem pré-processamento de escaneados"
 
 COPY src/ ./src/

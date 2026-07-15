@@ -127,30 +127,36 @@ class ScannedPreprocessor:
     # ------------------------------------------------------------------
 
     def _ensure_ocr_loaded(self) -> None:
-        """Inicializa o PaddleOCR na primeira chamada (lazy, tolerante a versão)."""
+        """
+        Inicializa o PaddleOCR na primeira chamada (lazy, tolerante a versão).
+
+        PaddleOCR mudou a API entre 2.x e 3.x — tenta configurações em ordem
+        decrescente de especificidade para cobrir ambas as versões sem crash.
+        """
         if self._ocr is not None or not _PADDLEOCR_AVAILABLE or _PaddleOCR is None:
             return
+
         import logging as _logging
-        # Suprime logs verbosos do PaddleOCR e PaddlePaddle via módulo logging
-        # (API preferida em PaddleOCR 3.x, que removeu o parâmetro show_log).
-        for _logger_name in ("ppocr", "paddle", "paddleocr"):
-            _logging.getLogger(_logger_name).setLevel(_logging.WARNING)
+        for _ln in ("ppocr", "paddle", "paddleocr", "ppdet"):
+            _logging.getLogger(_ln).setLevel(_logging.WARNING)
 
         logger.info("ScannedPreprocessor: inicializando PaddleOCR...")
-        # Tenta com parâmetros da API 3.x (sem show_log / use_gpu).
-        # Fallback para API 2.x se necessário.
-        try:
-            self._ocr = _PaddleOCR(use_angle_cls=True, lang="en")
-        except TypeError:
+
+        _init_configs = [
+            {"use_angle_cls": True, "lang": "en"},   # 2.x com suporte a pt-BR via latin
+            {"lang": "en"},                           # 3.x básico
+            {},                                       # defaults absolutos
+        ]
+        for cfg in _init_configs:
             try:
-                self._ocr = _PaddleOCR(
-                    use_angle_cls=True, lang="en",
-                    show_log=False, use_gpu=False,  # API 2.x
-                )
-            except Exception as exc:
-                logger.warning(f"ScannedPreprocessor: falha ao inicializar PaddleOCR: {exc}")
+                self._ocr = _PaddleOCR(**cfg)
+                logger.info(f"ScannedPreprocessor: PaddleOCR pronto (cfg={cfg}).")
                 return
-        logger.info("ScannedPreprocessor: PaddleOCR pronto.")
+            except Exception:
+                continue
+
+        logger.warning("ScannedPreprocessor: não foi possível inicializar PaddleOCR.")
+        self._ocr = None
 
     def _pdf_to_images(self, pdf_path: Path) -> Dict[int, np.ndarray]:
         """Converte cada página do PDF em imagem numpy via PyMuPDF."""

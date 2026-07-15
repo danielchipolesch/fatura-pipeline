@@ -1,4 +1,6 @@
 docling>=2.5.0
+# Pinado para evitar upgrade pelo PaddlePaddle 3.x (que puxa pypdfium2 5.x e quebra extração de texto)
+pypdfium2>=4,<5
 pydantic>=2.0.0
 python-dateutil>=2.8.2
 loguru>=0.7.2
