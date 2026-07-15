@@ -139,13 +139,19 @@ class FaturaPipeline:
         #      texto limpo. section_map/kv_pairs/spatial_index do Docling são
         #      preservados pois vêm da estrutura semântica (não do texto plano).
         if content.ocr_used and _paddle_available():
-            paddle_text, paddle_pages = self._scanned_preprocessor.extract(pdf_path)
-            if paddle_text:
-                content.full_text = paddle_text
-                content.page_texts = paddle_pages
-                logger.info(
-                    f"ScannedPreprocessor: full_text atualizado para {pdf_path.name} "
-                    f"({len(paddle_text)} chars)"
+            try:
+                paddle_text, paddle_pages = self._scanned_preprocessor.extract(pdf_path)
+                if paddle_text:
+                    content.full_text = paddle_text
+                    content.page_texts = paddle_pages
+                    logger.info(
+                        f"ScannedPreprocessor: full_text atualizado para {pdf_path.name} "
+                        f"({len(paddle_text)} chars)"
+                    )
+            except Exception as _paddle_exc:
+                logger.warning(
+                    f"ScannedPreprocessor: erro não-fatal em {pdf_path.name}: {_paddle_exc} — "
+                    f"continuando com texto do Docling OCR"
                 )
 
         # 3. DeterministicParser — fallback (regex sobre texto plano)

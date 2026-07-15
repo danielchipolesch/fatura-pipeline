@@ -127,16 +127,30 @@ class ScannedPreprocessor:
     # ------------------------------------------------------------------
 
     def _ensure_ocr_loaded(self) -> None:
-        """Inicializa o PaddleOCR na primeira chamada (lazy)."""
-        if self._ocr is None and _PADDLEOCR_AVAILABLE and _PaddleOCR is not None:
-            logger.info("ScannedPreprocessor: inicializando PaddleOCR...")
-            self._ocr = _PaddleOCR(
-                use_angle_cls=True,
-                lang="en",          # latin chars (incl. pt-BR) — melhor que 'pt' em versões atuais
-                show_log=False,
-                use_gpu=False,
-            )
-            logger.info("ScannedPreprocessor: PaddleOCR pronto.")
+        """Inicializa o PaddleOCR na primeira chamada (lazy, tolerante a versão)."""
+        if self._ocr is not None or not _PADDLEOCR_AVAILABLE or _PaddleOCR is None:
+            return
+        import logging as _logging
+        # Suprime logs verbosos do PaddleOCR e PaddlePaddle via módulo logging
+        # (API preferida em PaddleOCR 3.x, que removeu o parâmetro show_log).
+        for _logger_name in ("ppocr", "paddle", "paddleocr"):
+            _logging.getLogger(_logger_name).setLevel(_logging.WARNING)
+
+        logger.info("ScannedPreprocessor: inicializando PaddleOCR...")
+        # Tenta com parâmetros da API 3.x (sem show_log / use_gpu).
+        # Fallback para API 2.x se necessário.
+        try:
+            self._ocr = _PaddleOCR(use_angle_cls=True, lang="en")
+        except TypeError:
+            try:
+                self._ocr = _PaddleOCR(
+                    use_angle_cls=True, lang="en",
+                    show_log=False, use_gpu=False,  # API 2.x
+                )
+            except Exception as exc:
+                logger.warning(f"ScannedPreprocessor: falha ao inicializar PaddleOCR: {exc}")
+                return
+        logger.info("ScannedPreprocessor: PaddleOCR pronto.")
 
     def _pdf_to_images(self, pdf_path: Path) -> Dict[int, np.ndarray]:
         """Converte cada página do PDF em imagem numpy via PyMuPDF."""

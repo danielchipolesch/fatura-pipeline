@@ -1,0 +1,13 @@
+# Dependências opcionais para pré-processamento de PDFs escaneados.
+#
+# ATENÇÃO: PaddlePaddle 3.x puxa NumPy 2.x, que pode conflitar com versões
+# antigas do Docling. Instale em ambiente separado ou pós-instalação:
+#
+#   pip install -r requirements-scanned.txt
+#
+# O ScannedPreprocessor detecta automaticamente se estas dependências estão
+# disponíveis e degrada graciosamente caso não estejam.
+opencv-python-headless>=4.8.0
+pymupdf>=1.23.0
+paddlepaddle>=3.0.0
+paddleocr>=3.0.0

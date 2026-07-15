@@ -38,13 +38,14 @@ print('Docling models ready')" || echo "Model pre-warm skipped, will download at
 RUN python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR(); print('RapidOCR ready')" \
     || echo "RapidOCR pre-warm skipped, will initialize at runtime"
 
-# Pre-warm PaddleOCR models — baixa os modelos de detecção/reconhecimento no build
-# para evitar download em runtime (pode demorar alguns minutos no primeiro build)
-RUN python -c "\
-from paddleocr import PaddleOCR; \
-PaddleOCR(use_angle_cls=True, lang='en', show_log=False, use_gpu=False); \
-print('PaddleOCR ready')" \
-    || echo "PaddleOCR pre-warm skipped, will download at runtime"
+# Instala dependências opcionais para PDFs escaneados (PaddleOCR + OpenCV).
+# Separado do requirements.txt principal porque PaddlePaddle 3.x puxa NumPy 2.x,
+# que pode conflitar com Docling. Instalação com || true: se falhar, o pipeline
+# continua funcionando sem a camada de pré-processamento avançado.
+COPY requirements-scanned.txt .
+RUN pip install --no-cache-dir -r requirements-scanned.txt \
+    && python -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='en'); print('PaddleOCR ready')" \
+    || echo "PaddleOCR indisponível — pipeline funcionará sem pré-processamento de escaneados"
 
 COPY src/ ./src/
 
