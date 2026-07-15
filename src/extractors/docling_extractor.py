@@ -59,9 +59,6 @@ _KV_TOTAL = [
 _KV_CNPJ = [
     "cnpj", "cnpj/cpf", "cpf/cnpj",
 ]
-_KV_CITY = [
-    "município", "municipio", "munic.", "cidade",
-]
 _KV_STATE = [
     "u.f.", "uf", "estado",
 ]
@@ -173,7 +170,6 @@ class DoclingExtractor:
 
         # Acumula valores por tipo para distinguir supplier vs customer pela ordem
         cnpj_list:  list[str] = []
-        city_list:  list[str] = []
         state_list: list[str] = []
 
         for key, value in content.kv_pairs:
@@ -204,11 +200,6 @@ class DoclingExtractor:
                 if cnpj and cnpj not in cnpj_list:
                     cnpj_list.append(cnpj)
 
-            if _kv_matches(key_lower, _KV_CITY) and value_stripped:
-                v = value_stripped.upper()
-                if v not in city_list:
-                    city_list.append(v)
-
             if _kv_matches(key_lower, _KV_STATE) and len(value_stripped) == 2:
                 v = value_stripped.upper()
                 if v not in state_list:
@@ -225,11 +216,6 @@ class DoclingExtractor:
             result["supplier_cnpj"] = cnpj_list[0]
         if len(cnpj_list) >= 2 and "customer_cnpj" not in result:
             result["customer_cnpj"] = cnpj_list[1]
-
-        if city_list and "supplier_city" not in result:
-            result["supplier_city"] = city_list[0]
-        if len(city_list) >= 2 and "customer_city" not in result:
-            result["customer_city"] = city_list[1]
 
         if state_list and "supplier_state" not in result:
             result["supplier_state"] = state_list[0]
@@ -272,9 +258,7 @@ class DoclingExtractor:
                 if name:
                     result["supplier_name"] = name
 
-            city, state = _extract_city_state(supplier_text)
-            if city and "supplier_city" not in result:
-                result["supplier_city"] = city
+            _, state = _extract_city_state(supplier_text)
             if state and "supplier_state" not in result:
                 result["supplier_state"] = state
 
@@ -290,9 +274,7 @@ class DoclingExtractor:
                 if name:
                     result["customer_name"] = name
 
-            city, state = _extract_city_state(customer_text)
-            if city and "customer_city" not in result:
-                result["customer_city"] = city
+            _, state = _extract_city_state(customer_text)
             if state and "customer_state" not in result:
                 result["customer_state"] = state
 

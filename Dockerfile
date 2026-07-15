@@ -38,6 +38,14 @@ print('Docling models ready')" || echo "Model pre-warm skipped, will download at
 RUN python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR(); print('RapidOCR ready')" \
     || echo "RapidOCR pre-warm skipped, will initialize at runtime"
 
+# Pre-warm PaddleOCR models — baixa os modelos de detecção/reconhecimento no build
+# para evitar download em runtime (pode demorar alguns minutos no primeiro build)
+RUN python -c "\
+from paddleocr import PaddleOCR; \
+PaddleOCR(use_angle_cls=True, lang='en', show_log=False, use_gpu=False); \
+print('PaddleOCR ready')" \
+    || echo "PaddleOCR pre-warm skipped, will download at runtime"
+
 COPY src/ ./src/
 
 RUN mkdir -p /app/input /app/output /app/logs

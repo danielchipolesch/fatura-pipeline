@@ -60,14 +60,7 @@ class ParsingMethod(str, Enum):
 
 
 class Address(BaseModel):
-    street: Optional[str] = None
-    number: Optional[str] = None
-    complement: Optional[str] = None
-    neighborhood: Optional[str] = None
-    city: Optional[str] = None
     state: Optional[str] = None
-    zip_code: Optional[str] = None
-    country: str = "Brasil"
 
 
 class Party(BaseModel):
@@ -79,8 +72,6 @@ class Party(BaseModel):
     # Sempre um objeto Address (nunca None) — garante chaves estáveis no JSON
     # de saída, com valores null quando a informação não estiver disponível.
     address: Address = Field(default_factory=Address)
-    email: Optional[str] = None
-    phone: Optional[str] = None
 
 
 class LineItem(BaseModel):
@@ -269,9 +260,6 @@ class Invoice(BaseModel):
         Serializa para o dicionário de saída final.
 
         Transformações aplicadas (sem remover dados):
-          - Endereço de supplier e customer é achatado: os campos de Address
-            sobem um nível (invoice.supplier.city em vez de
-            invoice.supplier.address.city), eliminando um nível de nesting.
           - Campos reordenados em grupos semânticos (identificação → datas →
             partes → itens → totais → pagamento → metadados).
 

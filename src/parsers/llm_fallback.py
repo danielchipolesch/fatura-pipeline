@@ -64,13 +64,11 @@ não se limite apenas aos prioritários:
 - supplier_name: string (nome/razão social do emitente/fornecedor)
 - supplier_cnpj: string formato XX.XXX.XXX/XXXX-XX
 - supplier_cpf: string
-- supplier_city: string (cidade do emitente)
-- supplier_state: string (sigla UF do emitente)
+- supplier_state: string (sigla UF do emitente, ex: SP, MG, RJ)
 - customer_name: string (nome/razão social do destinatário/cliente)
 - customer_cnpj: string formato XX.XXX.XXX/XXXX-XX
 - customer_cpf: string
-- customer_city: string (cidade do destinatário)
-- customer_state: string (sigla UF do destinatário)
+- customer_state: string (sigla UF do destinatário, ex: SP, MG, RJ)
 - subtotal: number
 - total: number (valor total a pagar)
 - payment_method: string (forma de pagamento, ex: boleto, PIX, débito automático)
@@ -298,8 +296,8 @@ class LLMFallback:
 # Funções auxiliares (puras — sem estado)
 # ---------------------------------------------------------------------------
 
-_SUPPLIER_FIELDS = {"supplier_name", "supplier_cnpj", "supplier_cpf", "supplier_city", "supplier_state"}
-_CUSTOMER_FIELDS = {"customer_name", "customer_cnpj", "customer_cpf", "customer_city", "customer_state"}
+_SUPPLIER_FIELDS = {"supplier_name", "supplier_cnpj", "supplier_cpf", "supplier_state"}
+_CUSTOMER_FIELDS = {"customer_name", "customer_cnpj", "customer_cpf", "customer_state"}
 _ENERGY_FIELDS   = {"consumer_unit", "line_items"}
 
 _SUPPLIER_SECTION_KEYS = {"emitente", "fornecedor", "remetente", "vendedor", "prestador"}
@@ -406,8 +404,6 @@ def _merge(invoice: Invoice, data: dict) -> Invoice:
         invoice.supplier.cnpj = str(data["supplier_cnpj"])
     if not invoice.supplier.cpf and data.get("supplier_cpf"):
         invoice.supplier.cpf = str(data["supplier_cpf"])
-    if not invoice.supplier.address.city and data.get("supplier_city"):
-        invoice.supplier.address.city = str(data["supplier_city"])
     if not invoice.supplier.address.state and data.get("supplier_state"):
         invoice.supplier.address.state = str(data["supplier_state"])
 
@@ -418,8 +414,6 @@ def _merge(invoice: Invoice, data: dict) -> Invoice:
         invoice.customer.cnpj = str(data["customer_cnpj"])
     if not invoice.customer.cpf and data.get("customer_cpf"):
         invoice.customer.cpf = str(data["customer_cpf"])
-    if not invoice.customer.address.city and data.get("customer_city"):
-        invoice.customer.address.city = str(data["customer_city"])
     if not invoice.customer.address.state and data.get("customer_state"):
         invoice.customer.address.state = str(data["customer_state"])
 

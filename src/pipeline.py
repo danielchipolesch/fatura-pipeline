@@ -37,6 +37,7 @@ from src.parsers.deterministic import (
 )
 from src.parsers.docling_loader import DoclingLoader
 from src.parsers.llm_fallback import LLMFallback
+from src.parsers.scanned_preprocessor import ScannedPreprocessor, is_available as _paddle_available
 
 _CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))
 
@@ -52,11 +53,13 @@ class FaturaPipeline:
         self._docling_extractor = DoclingExtractor()
         self._deterministic = DeterministicParser()
         self._llm = LLMFallback()
+        self._scanned_preprocessor = ScannedPreprocessor()
 
         logger.info(
             f"Pipeline inicializado — "
             f"threshold={_CONFIDENCE_THRESHOLD:.2f} | "
-            f"llm_fallback={'habilitado' if self._llm.enabled else 'desabilitado'}"
+            f"llm_fallback={'habilitado' if self._llm.enabled else 'desabilitado'} | "
+            f"paddleocr={'habilitado' if _paddle_available() else 'indisponível'}"
         )
 
     # ------------------------------------------------------------------
@@ -128,6 +131,22 @@ class FaturaPipeline:
 
         # 2. DoclingExtractor — camada primária (estrutura semântica nativa)
         prefilled = self._docling_extractor.extract(content, layout)
+
+        # 2.5. ScannedPreprocessor — para documentos escaneados, substitui o
+        #      full_text e page_texts do Docling por texto extraído via
+        #      OpenCV + PaddleOCR, de qualidade superior para text plano.
+        #      Roda ANTES do DeterministicParser para que o regex opere sobre
+        #      texto limpo. section_map/kv_pairs/spatial_index do Docling são
+        #      preservados pois vêm da estrutura semântica (não do texto plano).
+        if content.ocr_used and _paddle_available():
+            paddle_text, paddle_pages = self._scanned_preprocessor.extract(pdf_path)
+            if paddle_text:
+                content.full_text = paddle_text
+                content.page_texts = paddle_pages
+                logger.info(
+                    f"ScannedPreprocessor: full_text atualizado para {pdf_path.name} "
+                    f"({len(paddle_text)} chars)"
+                )
 
         # 3. DeterministicParser — fallback (regex sobre texto plano)
         invoice = self._deterministic.parse(content, layout, prefilled=prefilled)

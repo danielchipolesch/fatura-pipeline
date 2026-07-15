@@ -37,14 +37,12 @@ from src.extractors.fields import (
     extract_date,
     extract_date_before_currency,
     extract_demand_overage_value,
-    extract_email,
     extract_energy_quantity_mwh,
     extract_labeled_value,
     extract_lines_after_label,
     extract_measured_demand_kw,
     extract_tarifa_azul_demand_nf3e,
     extract_number_after_hex_signature,
-    extract_phone,
     extract_reactive_excess,
     format_cnpj_digits,
     has_hex_signature,
@@ -186,47 +184,23 @@ class _FieldExtractor:
         cnpj = extract_cnpj(block_text)
         cpf = None if cnpj else extract_cpf(block_text)
         ie_m = re.search(r"INSCRI[ÇC][ÃA]O\s+ESTADUAL\s*[:\s]+([0-9.\-/]{5,20})", block_text, re.IGNORECASE)
-        email = extract_email(block_text)
-        phone = extract_phone(block_text)
-
-        # CEP
-        cep_m = re.search(r"\b(\d{5})[\-](\d{3})\b", block_text)
 
         # Estado: somente siglas válidas de UF brasileiras
         state = extract_br_state(block_text)
-
-        # Município: após label explícito, ou inline CIDADE/UF
-        city_m = re.search(
-            r"(?:MUN[IÍ]C[IÍ]PIO|CIDADE|MUNIC[ÍI]PIO)\s*[:\s]+([^\n,/]{3,40})",
-            block_text, re.IGNORECASE,
-        )
-        city: Optional[str] = city_m.group(1).strip() if city_m else None
-        if not city:
+        if not state:
             inline_m = re.search(
-                r"\b([A-ZÀ-Ú][A-ZÀ-Ú\s]{2,38}?)\s*/\s*([A-Z]{2})\b",
+                r"\b[A-ZÀ-Ú][A-ZÀ-Ú\s]{2,38}?\s*/\s*([A-Z]{2})\b",
                 block_text.upper(),
             )
             if inline_m:
-                candidate_state = extract_br_state(inline_m.group(2))
-                if candidate_state:
-                    city = inline_m.group(1).strip()
-                    if not state:
-                        state = candidate_state
-
-        address = Address(
-            zip_code=f"{cep_m.group(1)}-{cep_m.group(2)}" if cep_m else None,
-            state=state,
-            city=city,
-        )
+                state = extract_br_state(inline_m.group(1)) or state
 
         return Party(
             name=name_line.strip() if name_line else None,
             cnpj=cnpj,
             cpf=cpf,
             ie=ie_m.group(1).strip() if ie_m else None,
-            address=address,
-            email=email,
-            phone=phone,
+            address=Address(state=state),
         )
 
     @classmethod
@@ -611,7 +585,7 @@ class DeterministicParser:
         due_date = pre.get("due_date") or ext.due_date(text, layout)
 
         # Supplier: se DoclingExtractor já extraiu nome/cnpj, usa como base e
-        # complementa com regex (endereço, e-mail, telefone, IE).
+        # complementa com regex (estado, IE).
         if pre.get("supplier_name") or pre.get("supplier_cnpj"):
             supplier = Party(
                 name=pre.get("supplier_name"),
@@ -623,14 +597,8 @@ class DeterministicParser:
                     supplier.name = regex_supplier.name
                 if not supplier.cnpj and regex_supplier.cnpj:
                     supplier.cnpj = regex_supplier.cnpj
-                if regex_supplier.address and (
-                    regex_supplier.address.city or regex_supplier.address.state
-                ):
+                if regex_supplier.address and regex_supplier.address.state:
                     supplier.address = regex_supplier.address
-                if regex_supplier.email:
-                    supplier.email = regex_supplier.email
-                if regex_supplier.phone:
-                    supplier.phone = regex_supplier.phone
         else:
             supplier = ext.supplier(text, layout)
 
@@ -646,29 +614,16 @@ class DeterministicParser:
                     customer.name = regex_customer.name
                 if not customer.cnpj and regex_customer.cnpj:
                     customer.cnpj = regex_customer.cnpj
-                if regex_customer.address and (
-                    regex_customer.address.city or regex_customer.address.state
-                ):
+                if regex_customer.address and regex_customer.address.state:
                     customer.address = regex_customer.address
-                if regex_customer.email:
-                    customer.email = regex_customer.email
-                if regex_customer.phone:
-                    customer.phone = regex_customer.phone
         else:
             customer = ext.customer(text, layout)
 
-        # DoclingExtractor via kv_pairs/section_map tem prioridade para cidade/UF —
-        # substitui o valor regex que pode ter sofrido contaminação entre seções.
-        if supplier:
-            if pre.get("supplier_city"):
-                supplier.address.city = pre["supplier_city"]
-            if pre.get("supplier_state"):
-                supplier.address.state = pre["supplier_state"]
-        if customer:
-            if pre.get("customer_city"):
-                customer.address.city = pre["customer_city"]
-            if pre.get("customer_state"):
-                customer.address.state = pre["customer_state"]
+        # DoclingExtractor via kv_pairs/section_map tem prioridade para UF.
+        if supplier and pre.get("supplier_state"):
+            supplier.address.state = pre["supplier_state"]
+        if customer and pre.get("customer_state"):
+            customer.address.state = pre["customer_state"]
 
         # Total: DoclingExtractor via kv_pairs/spatial tem prioridade; labels regex como fallback.
         total = pre.get("total") or ext.total_via_labels(text, layout)
@@ -738,8 +693,7 @@ class DeterministicParser:
                             supplier.name = known_nfe.get("name")
                         if not supplier.cnpj:
                             supplier.cnpj = known_nfe.get("cnpj")
-                        if not supplier.address.city:
-                            supplier.address.city = known_nfe.get("city")
+                        if not supplier.address.state:
                             supplier.address.state = known_nfe.get("state")
 
         # -- Itens --
@@ -778,8 +732,7 @@ class DeterministicParser:
             if known:
                 if not supplier.name:
                     supplier.name = known.get("name")
-                if not supplier.address.city and not supplier.address.state:
-                    supplier.address.city = known.get("city")
+                if not supplier.address.state:
                     supplier.address.state = known.get("state")
 
         # CNPJ do destinatário via rótulo: independente da chave de acesso —
