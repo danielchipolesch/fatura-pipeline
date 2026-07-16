@@ -74,6 +74,13 @@ class Party(BaseModel):
     address: Address = Field(default_factory=Address)
 
 
+class Tax(BaseModel):
+    name: str                    # ICMS, ISS, IPI, PIS, COFINS, etc.
+    base: NumericValue = None
+    rate: NumericValue = None
+    amount: NumericValue = None
+
+
 class LineItem(BaseModel):
     code: Optional[str] = None
     description: str
@@ -85,55 +92,10 @@ class LineItem(BaseModel):
     discount: NumericValue = None
     tax_rate: NumericValue = None
     total: NumericValue = None
-
-
-class Tax(BaseModel):
-    name: str                    # ICMS, ISS, IPI, PIS, COFINS, etc.
-    base: NumericValue = None
-    rate: NumericValue = None
-    amount: NumericValue = None
-
-
-class EnergyMetrics(BaseModel):
-    """
-    Métricas técnicas específicas de faturas de energia elétrica, relevantes
-    para BI e gestão de mercado de energia (cativo/livre). Todo campo aqui é
-    extraído diretamente do texto da fatura — NUNCA calculado a partir de
-    outros campos. Quando o dado não está impresso no documento (ex: fator
-    de potência, ausente em todos os layouts mapeados até o momento), o
-    campo permanece null — isso é informação válida (ausência confirmada),
-    não uma falha de extração.
-
-    Demanda medida: faturas em tarifa Horosazonal Verde têm um único valor
-    de demanda (sem distinção ponta/fora-ponta — convencionalmente chamado
-    "fora ponta" pelo padrão ANEEL/CEMIG/Enel). Faturas em tarifa Azul
-    trariam ambos os valores separadamente, mas nenhuma amostra analisada
-    até agora usa essa modalidade.
-
-    consumer_unit vs client_number: são identificadores DIFERENTES e não
-    devem ser confundidos. A Unidade Consumidora (UC) identifica o ponto de
-    conexão/instalação física (rótulos: "UC", "Nº DA INSTALAÇÃO",
-    "UNID. CONSUMIDORA"). O Número do Cliente identifica a conta/contrato
-    do cliente junto à concessionária (rótulo: "Nº DO CLIENTE") — um mesmo
-    cliente pode ter várias UCs, e vice-versa em alguns arranjos.
-    """
-    consumer_unit: Optional[str] = None  # Unidade Consumidora (UC) / Nº da Instalação
-    client_number: Optional[str] = None  # Número do Cliente junto à concessionária (≠ UC)
-    consumption_peak_kwh: NumericValue = None        # Consumo ativo medido na ponta (kWh)
-    consumption_offpeak_kwh: NumericValue = None      # Consumo ativo medido fora de ponta (kWh)
-    measured_demand_peak_kw: NumericValue = None      # Demanda medida na ponta (kW) — tarifa Azul
-    measured_demand_offpeak_kw: NumericValue = None   # Demanda medida fora de ponta / única (kW)
-    power_factor_measured: NumericValue = None        # Fator de potência medido
-    reactive_energy_excess_peak_kwh: NumericValue = None     # UFER ponta (kWh)
-    reactive_energy_excess_offpeak_kwh: NumericValue = None  # UFER fora de ponta (kWh)
-    demand_overage_value: NumericValue = None         # Valor (R$) de ultrapassagem de demanda contratada
-    reactive_penalty_peak_value: NumericValue = None      # Valor (R$) da multa reativa (UFER) na ponta
-    reactive_penalty_offpeak_value: NumericValue = None   # Valor (R$) da multa reativa (UFER) fora de ponta
-    # Energia adquirida de comercializadora (ACL) — só presente em faturas
-    # DISTRIBUIDORA_MLE; representa o crédito de energia injetada pela
-    # comercializadora, listado como abatimento na fatura da distribuidora.
-    third_party_energy_peak_kwh: NumericValue = None      # Energia Terc. Comercializad HP (kWh)
-    third_party_energy_offpeak_kwh: NumericValue = None   # Energia Terc. Comercializad HFP (kWh)
+    # Tributos embutidos neste item (ICMS, PIS, COFINS por linha quando
+    # a fatura detalha impostos por componente de energia, ex: CEMIG NF-e).
+    # Lista vazia = imposto não detalhado por item (vai em Invoice.taxes).
+    taxes: List[Tax] = Field(default_factory=list)
 
 
 class Invoice(BaseModel):
@@ -155,6 +117,13 @@ class Invoice(BaseModel):
         fatura para esse campo, mas o parser não conseguiu interpretá-lo —
         sinaliza que o padrão de extração precisa de ajuste, sem se
         confundir com uma ausência real.
+
+    Sobre consumer_unit vs client_number:
+      São identificadores DIFERENTES. A Unidade Consumidora (UC) identifica
+      o ponto de conexão/instalação física. O Número do Cliente identifica
+      a conta/contrato junto à concessionária — um mesmo cliente pode ter
+      várias UCs. Ambos são metadados de identificação, não itens de cobrança,
+      por isso ficam no nível do Invoice e não em line_items.
     """
 
     # Identificação
@@ -173,18 +142,26 @@ class Invoice(BaseModel):
     supplier: Party = Field(default_factory=Party)
     customer: Party = Field(default_factory=Party)
 
-    # Itens e tributos
-    line_items: List[LineItem] = Field(default_factory=list)
-    taxes: List[Tax] = Field(default_factory=list)
-
-    # Métricas de energia para BI — sempre um objeto (nunca None), mesmo
-    # princípio do Address/Party acima.
-    energy: EnergyMetrics = Field(default_factory=EnergyMetrics)
+    # Identificadores da instalação de energia (metadados, não itens de cobrança)
+    consumer_unit: Optional[str] = None  # Unidade Consumidora (UC) / Nº da Instalação
+    client_number: Optional[str] = None  # Número do Cliente junto à concessionária (≠ UC)
 
     # Tipo operacional da fatura — inferido por regras (não lido diretamente
     # do documento). None quando a fatura não é de energia ou não há sinais
     # suficientes para classificar com segurança.
     tipo_fatura_operacional: Optional[TipoFaturaOperacional] = None
+
+    # Itens e tributos
+    # line_items: TODOS os componentes de cobrança da fatura (produtos, serviços,
+    # componentes de energia: TUSD HP/HFP, TE HP/HFP, consumo, demanda, energia
+    # terceirizada, multas, etc.). Cada item pode ter tributos embutidos (item.taxes)
+    # quando a fatura detalha impostos por componente de energia.
+    line_items: List[LineItem] = Field(default_factory=list)
+    # taxes: apenas tributos cobrados de forma independente, sem vínculo com
+    # um item específico (ex: ICMS, PIS, COFINS em NF-e com tabela de cálculo
+    # separada). Quando os tributos aparecem embutidos nos itens, ficam em
+    # item.taxes e este campo fica vazio.
+    taxes: List[Tax] = Field(default_factory=list)
 
     # Totais
     subtotal: NumericValue = None
@@ -248,8 +225,10 @@ class Invoice(BaseModel):
         "issue_date", "due_date", "service_period_start", "service_period_end",
         # Partes
         "supplier", "customer",
-        # Itens, tributos e métricas de energia
-        "line_items", "taxes", "energy",
+        # Identificadores de instalação de energia
+        "consumer_unit", "client_number",
+        # Itens e tributos
+        "line_items", "taxes",
         # Totais e moeda
         "subtotal", "discount", "total_taxes", "total", "currency",
         # Pagamento
@@ -266,7 +245,7 @@ class Invoice(BaseModel):
 
         Transformações aplicadas (sem remover dados):
           - Campos reordenados em grupos semânticos (identificação → datas →
-            partes → itens → totais → pagamento → metadados).
+            partes → instalação → itens → totais → pagamento → metadados).
 
         Todas as chaves do modelo estão presentes no JSON de saída — campos
         sem valor aparecem como null. Exceção: `raw_text` (dado interno de

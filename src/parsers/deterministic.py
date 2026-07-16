@@ -31,20 +31,14 @@ from src.extractors.fields import (
     extract_cnpj_after_label,
     extract_client_number,
     extract_consumer_unit,
-    extract_consumption_kwh,
-    extract_third_party_energy_kwh,
+    extract_energy_quantity_mwh,
     extract_cpf,
     extract_currency,
     extract_date,
     extract_date_before_currency,
-    extract_demand_overage_value,
-    extract_energy_quantity_mwh,
     extract_labeled_value,
     extract_lines_after_label,
-    extract_measured_demand_kw,
-    extract_tarifa_azul_demand_nf3e,
     extract_number_after_hex_signature,
-    extract_reactive_excess,
     format_cnpj_digits,
     has_hex_signature,
     parse_currency,
@@ -59,7 +53,6 @@ from src.extractors.known_entities import (
 )
 from src.models.invoice import (
     Address,
-    EnergyMetrics,
     Invoice,
     InvoiceLayout,
     LineItem,
@@ -527,45 +520,128 @@ def _extract_line_items_from_text(text: str, layout: InvoiceLayout) -> list[Line
 
 
 # ---------------------------------------------------------------------------
-# Bridge: line_items → energy (normalização)
+# Fallback textual: extração de itens de NF-e de energia sem tabela Docling
 # ---------------------------------------------------------------------------
 
-# Mapeamento: padrão de descrição → (campo_peak, campo_offpeak)
-# Cada tupla contém o atributo de EnergyMetrics que deve ser preenchido.
-_ENERGY_BRIDGE_RULES: list[tuple[re.Pattern, str]] = [
-    # CEMIG NF-e
-    (re.compile(r"consumo\s+de\s+energia\s+el[eé]trica\s+hfp\b", re.IGNORECASE), "consumption_offpeak_kwh"),
-    (re.compile(r"consumo\s+de\s+energia\s+el[eé]trica\s+hp\b",  re.IGNORECASE), "consumption_peak_kwh"),
-    (re.compile(r"energia\s+terc[a-z]*\s+comercializad[a-z]*\s+hfp\b", re.IGNORECASE), "third_party_energy_offpeak_kwh"),
-    (re.compile(r"energia\s+terc[a-z]*\s+comercializad[a-z]*\s+hp\b",  re.IGNORECASE), "third_party_energy_peak_kwh"),
-    # Enel SP / formato ANEEL antigo
-    (re.compile(r"consumo\s+ativo\s+f\.?\s*ponta", re.IGNORECASE), "consumption_offpeak_kwh"),
-    (re.compile(r"consumo\s+ativo\s+ponta",         re.IGNORECASE), "consumption_peak_kwh"),
+# Mapeamento label → (descrição canônica, unidade) para itens de energia.
+# Quando o Docling não extrai a tabela de produtos/serviços, tentamos
+# identificar as linhas pelo rótulo e reconstruir o LineItem.
+_ENERGY_ITEM_PATTERNS: list[tuple[re.Pattern, str, str]] = [
+    # CEMIG NF-e / NF3E
+    (re.compile(r"Consumo\s+de\s+energia\s+el[eé]trica\s+HFP\b", re.IGNORECASE),
+     "Consumo de energia elétrica HFP", "kWh"),
+    (re.compile(r"Consumo\s+de\s+energia\s+el[eé]trica\s+HP\b", re.IGNORECASE),
+     "Consumo de energia elétrica HP",  "kWh"),
+    (re.compile(r"Energia\s+Terc[a-z]*\s+Comercializad[a-z]*\s+HFP\b", re.IGNORECASE),
+     "Energia Terc Comercializad HFP", "kWh"),
+    (re.compile(r"Energia\s+Terc[a-z]*\s+Comercializad[a-z]*\s+HP\b", re.IGNORECASE),
+     "Energia Terc Comercializad HP",  "kWh"),
+    # TUSD e TE (rótulo genérico sem HP/HFP — alguns layouts abreviam)
+    (re.compile(r"TUSD\s+(?:HP|Hora\s+de\s+Ponta)\b", re.IGNORECASE),
+     "TUSD HP", "kWh"),
+    (re.compile(r"TUSD\s+(?:HFP|F\.?\s*Ponta|Hora\s+Fora\s+de\s+Ponta)\b", re.IGNORECASE),
+     "TUSD HFP", "kWh"),
+    (re.compile(r"\bTE\s+(?:HP|Hora\s+de\s+Ponta)\b", re.IGNORECASE),
+     "TE HP", "kWh"),
+    (re.compile(r"\bTE\s+(?:HFP|F\.?\s*Ponta|Hora\s+Fora\s+de\s+Ponta)\b", re.IGNORECASE),
+     "TE HFP", "kWh"),
+    # Enel SP / ANEEL antigo
+    (re.compile(r"CONSUMO\s+ATIVO\s+PONTA\s+(?:TE|TUSD)\b", re.IGNORECASE),
+     "Consumo Ativo Ponta", "kWh"),
+    (re.compile(r"CONSUMO\s+ATIVO\s+F\.?\s*PONTA\s+(?:TE|TUSD)\b", re.IGNORECASE),
+     "Consumo Ativo Fora de Ponta", "kWh"),
+    # Demanda e reativo
+    (re.compile(r"\bDEMANDA\b(?!\s+CONTRAT)", re.IGNORECASE),
+     "Demanda", "kW"),
+    (re.compile(r"ULTRAPASSAGEM\s+DEMANDA\b", re.IGNORECASE),
+     "Ultrapassagem Demanda", "kW"),
+    (re.compile(r"UFER\s+PONTA\b", re.IGNORECASE),
+     "UFER Ponta", "kWh"),
+    (re.compile(r"UFER\s+(?:F\.?\s*PONTA|HFP)\b", re.IGNORECASE),
+     "UFER Fora de Ponta", "kWh"),
+    # Comercializadora
+    (re.compile(r"ENERGIA\s+EL[ÉE]TRICA\b", re.IGNORECASE),
+     "Energia Elétrica", "MWh"),
 ]
 
+_NUM = r"-?[\d.,]+"  # número (possivelmente negativo)
+_NUM_POS = r"[\d.,]+"  # número positivo
 
-def _sync_energy_from_items(line_items: list, energy) -> None:
-    """
-    Espelha dados de consumo de `line_items` em `energy` quando o extrator
-    de texto não conseguiu preencher o campo (ex: PDF sem OCR onde o Docling
-    capturou a tabela mas o texto plano não tinha o rótulo esperado).
 
-    Só preenche campos que ainda estão null — nunca sobrescreve resultados
-    do extrator de texto, que tem maior confiabilidade de posicionamento.
-    Quantidade negativa (créditos de "Energia Terc.") é armazenada como
-    valor absoluto, pois o campo representa magnitude de energia.
+def _extract_energy_items_from_text(text: str) -> list[LineItem]:
     """
-    for item in line_items:
-        desc = item.description or ""
-        for pattern, field in _ENERGY_BRIDGE_RULES:
-            if not pattern.search(desc):
+    Extrai itens de fatura de energia a partir do texto plano quando o
+    Docling não capturou a tabela de produtos/serviços.
+
+    Estrutura esperada (linha-por-linha):
+      <RÓTULO DO ITEM>
+      <UNIDADE>
+      <QUANTIDADE>
+      <PREÇO UNITÁRIO>
+      <VALOR TOTAL>
+
+    Também lida com o formato inline:
+      <RÓTULO> <UNIDADE> <QUANTIDADE> <PREÇO> <VALOR>
+    """
+    items: list[LineItem] = []
+    seen_descs: set[str] = set()
+
+    lines = text.splitlines()
+
+    for pattern, canonical_desc, canonical_unit in _ENERGY_ITEM_PATTERNS:
+        for i, line in enumerate(lines):
+            if not pattern.search(line.strip()):
                 continue
-            if getattr(energy, field) is not None:
-                break  # já preenchido pelo extrator de texto
-            qty = item.quantity
-            if isinstance(qty, (int, float)) and qty != 0:
-                setattr(energy, field, abs(qty))
-            break
+            if canonical_desc in seen_descs:
+                break  # já capturado (evita duplicatas TE + TUSD com mesmo desc)
+
+            qty = unit_price = total = None
+            unit = canonical_unit
+
+            # Tenta formato inline: "... kWh 1234,56 0,12345 789,01 ..."
+            inline_nums = re.findall(_NUM, line)
+            inline_nums = [parse_currency(n) for n in inline_nums if parse_currency(n) is not None]
+
+            # Lê linhas seguintes em busca de qty / price / total
+            for j in range(i + 1, min(i + 6, len(lines))):
+                l = lines[j].strip()
+                if not l or re.match(r"^[A-ZÀ-Ú]{4,}(\s+[A-ZÀ-Ú]+){0,3}$", l):
+                    # Linha em branco ou novo rótulo — para a leitura do bloco
+                    if not re.match(r"^[Kk][Ww][Hh]|^[Mm][Ww]", l):
+                        break
+                # Unidade
+                if re.match(r"^[Kk][Ww][Hh]$|^[Mm][Ww][Hh]?$|^[Kk][Ww]$", l, re.IGNORECASE):
+                    unit = l.upper()
+                    continue
+                n = parse_currency(l)
+                if n is None:
+                    continue
+                if qty is None:
+                    qty = n
+                elif unit_price is None:
+                    unit_price = n
+                elif total is None:
+                    total = n
+
+            # Fallback inline: usa os números da linha original se não achou nos seguintes
+            if qty is None and len(inline_nums) >= 1:
+                qty = inline_nums[0]
+            if unit_price is None and len(inline_nums) >= 2:
+                unit_price = inline_nums[1]
+            if total is None and len(inline_nums) >= 3:
+                total = inline_nums[2]
+
+            if qty is not None or total is not None:
+                items.append(LineItem(
+                    description=canonical_desc,
+                    unit=unit,
+                    quantity=abs(qty) if isinstance(qty, float) else qty,
+                    unit_price=unit_price,
+                    total=total,
+                ))
+                seen_descs.add(canonical_desc)
+
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -740,14 +816,34 @@ class DeterministicParser:
                             supplier.address.state = known_nfe.get("state")
 
         # -- Itens --
-        # DoclingExtractor pode ter extraído itens estruturados da tabela Docling
-        # (camada primária); só executa extração própria se não foram preenchidos.
+        # Ordem de prioridade:
+        #   1. DoclingExtractor (tabelas estruturadas — maior qualidade)
+        #   2. Fallback textual genérico (layout NF-e/NFS-e/boleto)
+        #   3. Fallback textual de energia (items HP/HFP/TUSD/TE/demanda)
         line_items = (
             pre.get("line_items")
             or _extract_line_items_from_tables(content.tables)
         )
         if not line_items:
             line_items = _extract_line_items_from_text(text, layout)
+
+        # Fallback de energia: para faturas sem tabela capturável pelo Docling,
+        # tenta extrair itens de energia do texto plano. Só ativa se line_items
+        # ainda estiver vazio OU se não houver nenhum item com quantidade kWh/MWh.
+        if not line_items:
+            energy_items = _extract_energy_items_from_text(text)
+            if energy_items:
+                line_items = energy_items
+        else:
+            # line_items tem dados, mas pode ter vindo de NF-e de comercializadora
+            # onde só o cabeçalho ficou (sem linha de produto). Testa se algum
+            # item tem quantidade numérica; caso contrário, complementa com
+            # fallback de energia.
+            has_qty = any(isinstance(i.quantity, (int, float)) for i in line_items)
+            if not has_qty:
+                energy_items = _extract_energy_items_from_text(text)
+                if energy_items:
+                    line_items = energy_items
 
         # -- Série (NF-e) --
         series = None
@@ -813,57 +909,20 @@ class DeterministicParser:
                 if known_name:
                     customer.name = known_name
 
-        # -- Métricas de energia para BI (apenas faturas de energia elétrica) --
-        # Extração puramente direta: nenhum valor aqui é calculado a partir de
-        # outro campo. Quando o dado não está impresso na fatura (ex: fator de
-        # potência), o campo correspondente fica null — ausência confirmada,
-        # não falha de extração. Ver EnergyMetrics para detalhes de cada campo.
-        energy = EnergyMetrics(
-            consumer_unit=pre.get("consumer_unit") or extract_consumer_unit(text),
-            client_number=extract_client_number(text),
-            measured_demand_offpeak_kw=extract_measured_demand_kw(text),
-            demand_overage_value=extract_demand_overage_value(text),
-        )
-        energy.consumption_peak_kwh, energy.consumption_offpeak_kwh = extract_consumption_kwh(text)
-        tp_peak, tp_offpeak = extract_third_party_energy_kwh(text)
-        energy.third_party_energy_peak_kwh = tp_peak
-        energy.third_party_energy_offpeak_kwh = tp_offpeak
-        reactive = extract_reactive_excess(text)
-        energy.reactive_energy_excess_peak_kwh = reactive["peak_kwh"]
-        energy.reactive_energy_excess_offpeak_kwh = reactive["offpeak_kwh"]
-        energy.reactive_penalty_peak_value = reactive["peak_value"]
-        energy.reactive_penalty_offpeak_value = reactive["offpeak_value"]
+        # -- Identificadores de instalação de energia --
+        consumer_unit = pre.get("consumer_unit") or extract_consumer_unit(text)
+        client_number = extract_client_number(text)
 
-        # DANF3E / Tarifa Azul: demanda ponta e fora-ponta separadas
-        peak_demand, fp_demand = extract_tarifa_azul_demand_nf3e(text)
-        if peak_demand is not None:
-            energy.measured_demand_peak_kw = peak_demand
-        if fp_demand is not None:
-            energy.measured_demand_offpeak_kw = fp_demand
-
-        # NF-e de comercializadora: quantidade em MWh da linha de produto
-        # (substitui consumption_offpeak_kwh como proxy de consumo total)
-        if layout == InvoiceLayout.NFE and energy.consumption_offpeak_kwh is None:
+        # NF-e de comercializadora sem line_items: cria item a partir da
+        # quantidade em MWh encontrada no texto (QUANT. / coluna de tabela invertida).
+        if layout == InvoiceLayout.NFE and not line_items:
             mwh = extract_energy_quantity_mwh(text)
             if mwh is not None:
-                energy.consumption_offpeak_kwh = mwh
-
-        # Fallback via line_items: item com unidade MWh e quantidade numérica
-        # (cobre casos em que o valor está na tabela Docling mas não no texto plano)
-        if layout == InvoiceLayout.NFE and energy.consumption_offpeak_kwh is None:
-            for item in line_items:
-                unit_norm = re.sub(r"[\s/]", "", (item.unit or "")).upper()
-                if "MWH" in unit_norm and item.quantity is not None:
-                    q = item.quantity
-                    if isinstance(q, (int, float)) and 0 < q < 99999:
-                        energy.consumption_offpeak_kwh = q
-                        break
-
-        # Bridge: espelha line_items → energy para campos ainda null.
-        # Garante que a mesma informação (ex: "Consumo de energia elétrica HFP")
-        # sempre popula `energy`, independente de o Docling ter capturado via
-        # tabela (→ line_items) ou via texto plano (→ regex acima).
-        _sync_energy_from_items(line_items, energy)
+                line_items = [LineItem(
+                    description="Energia Elétrica",
+                    unit="MWh",
+                    quantity=mwh,
+                )]
 
         invoice = Invoice(
             invoice_number=invoice_number,
@@ -874,9 +933,10 @@ class DeterministicParser:
             due_date=due_date,
             supplier=supplier or Party(),
             customer=customer or Party(),
+            consumer_unit=consumer_unit,
+            client_number=client_number,
             line_items=line_items,
             taxes=taxes,
-            energy=energy,
             subtotal=subtotal,
             total=total,
             bank_slip_barcode=barcode,

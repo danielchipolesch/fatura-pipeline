@@ -14,21 +14,53 @@ import pandas as pd
 from src.extractors.fields import parse_currency
 from src.models.invoice import LineItem
 
-_desc_aliases  = {"descri", "produto", "servi", "item", "discrimina", "histor"}
+_desc_aliases  = {"descri", "produto", "servi", "item", "discrimina", "histor", "especif"}
 _qty_aliases   = {"qtd", "quant", "qty", "amount"}
 _price_aliases = {"unit", "pre", "price", "valor unit"}
 _total_aliases = {"total", "valor total", "vlr total", "subtotal"}
+_code_aliases  = {"cod", "código", "codigo", "ref", "ncm", "cfop"}
 
+# Linhas que são cabeçalhos residuais ou metadados de histórico de leitura —
+# não representam itens de cobrança.
 _NOISE_ROW = re.compile(
-    r"^(TOTAL|SUBTOTAL|HISTÓRICO|HISTÓRIA|MÊS|ANO|UF|HP|HFP|HR|\d{1,2}/\d{2,4}|"
+    r"^(TOTAL|SUBTOTAL|HISTÓRICO|HISTÓRIA|MÊS|ANO|UF|\d{1,2}/\d{2,4}|"
     r"OUT|SET|AGO|JUL|JUN|MAI|ABR|MAR|FEV|JAN|DEZ|NOV|$)",
     re.IGNORECASE,
 )
+
+# Padrão de "código de produto curto" — quando a coluna de descrição contém
+# apenas códigos (ex: ZENF01, 100, ENER01) em vez de texto descritivo.
+_IS_CODE = re.compile(r"^[A-Z0-9]{2,12}$")
 
 
 def _col_match(col_name: str, aliases: set) -> bool:
     normalized = str(col_name).lower().strip()
     return any(a in normalized for a in aliases)
+
+
+def _pick_desc_col(cols: list) -> str:
+    """
+    Escolhe a coluna de descrição entre as colunas disponíveis.
+
+    Heurística:
+    1. Coluna cujo nome contém um dos _desc_aliases
+    2. Coluna cujo nome contém "nome"
+    3. Se a primeira coluna tem nome que parece código (code alias), tenta a segunda
+    4. Fallback: primeira coluna
+    """
+    # 1. Alias direto
+    for c in cols:
+        if _col_match(c, _desc_aliases):
+            return c
+    # 2. "nome"
+    for c in cols:
+        if "nome" in str(c).lower():
+            return c
+    # 3. Se col[0] é código, tenta col[1]
+    if len(cols) >= 2 and _col_match(cols[0], _code_aliases):
+        return cols[1]
+    # 4. Fallback
+    return cols[0]
 
 
 def extract_line_items_from_tables(tables: List[pd.DataFrame]) -> List[LineItem]:
@@ -39,6 +71,7 @@ def extract_line_items_from_tables(tables: List[pd.DataFrame]) -> List[LineItem]
     Heurísticas especiais para NF-e:
       - Fallback 1: valor numérico no nome da coluna (inversão header/dado do Docling)
       - Fallback 2: "V.TOTAL/V.UNITARIO <qty>" embutido no nome de outra coluna
+      - Fallback 3: coluna de código (ex: "ZENF01") ≠ coluna de descrição
     """
     items: List[LineItem] = []
 
@@ -51,7 +84,7 @@ def extract_line_items_from_tables(tables: List[pd.DataFrame]) -> List[LineItem]
         if not (has_desc or (has_value and len(cols) >= 3)):
             continue
 
-        desc_col  = next((c for c in cols if _col_match(c, _desc_aliases)), cols[0])
+        desc_col  = _pick_desc_col(cols)
         qty_col   = next((c for c in cols if _col_match(c, _qty_aliases)), None)
         price_col = next((c for c in cols if _col_match(c, _price_aliases)), None)
         total_col = next((c for c in cols if _col_match(c, _total_aliases)), None)
@@ -59,6 +92,8 @@ def extract_line_items_from_tables(tables: List[pd.DataFrame]) -> List[LineItem]
             (c for c in cols if str(c).strip().upper() in ("UN", "UNID", "UNIDADE", "UNIT", "UND")),
             None,
         )
+        # Coluna de código do produto (separada da descrição)
+        code_col  = next((c for c in cols if _col_match(c, _code_aliases) and c != desc_col), None)
 
         for _, row in df.iterrows():
             desc_val = str(row.get(desc_col, "")).strip()
@@ -68,6 +103,25 @@ def extract_line_items_from_tables(tables: List[pd.DataFrame]) -> List[LineItem]
                 continue
             if re.match(r"^[\d.,\s]+$", desc_val):
                 continue
+
+            # Se a descrição parece um código curto (ex: "ZENF01"), tenta usar
+            # a próxima coluna disponível que não seja numérica como descrição real.
+            if _IS_CODE.match(desc_val):
+                # Guarda o valor como code, tenta next text column as description
+                code_candidate = desc_val
+                alt_desc = None
+                for c in cols:
+                    if c == desc_col:
+                        continue
+                    v = str(row.get(c, "")).strip()
+                    if v and v.lower() not in ("nan", "none", "") and not re.match(r"^[\d.,\s]+$", v) and not _IS_CODE.match(v):
+                        alt_desc = v
+                        break
+                if alt_desc:
+                    desc_val = alt_desc
+                    # Não sobrescreve code_col se já temos um; usa o candidato
+                    if not code_col:
+                        code_col = desc_col
 
             qty = None
             if qty_col and str(row.get(qty_col, "")).strip():
@@ -106,7 +160,14 @@ def extract_line_items_from_tables(tables: List[pd.DataFrame]) -> List[LineItem]
             if total_col and str(row.get(total_col, "")).strip():
                 total_val = parse_currency(str(row[total_col]))
 
+            code_val = None
+            if code_col:
+                v = str(row.get(code_col, "")).strip()
+                if v and v.lower() not in ("nan", "none", ""):
+                    code_val = v
+
             items.append(LineItem(
+                code=code_val,
                 description=desc_val,
                 unit=unit,
                 quantity=qty,
