@@ -585,28 +585,89 @@ def extract_client_number(text: str) -> Optional[str]:
 
 def extract_consumption_kwh(text: str) -> tuple[float | str | None, float | str | None]:
     """
-    Extrai consumo ativo medido (kWh), a partir dos itens de fatura
-    "CONSUMO ATIVO PONTA" e "CONSUMO ATIVO F. PONTA" (TE ou TUSD — mesma
-    quantidade, são apenas componentes tarifários diferentes sobre o mesmo
-    consumo). Retorna (consumo_ponta_kwh, consumo_fora_ponta_kwh) — cada um
-    None (rótulo não encontrado) ou READ_ERROR_SENTINEL (rótulo encontrado,
-    valor ilegível) quando aplicável.
-    """
-    peak = None
-    m = re.search(
-        r"CONSUMO\s+ATIVO\s+PONTA\s+(?:TE|TUSD)\s*\n?\s*KWH\s*\n?\s*([\d.,]+)",
-        text, re.IGNORECASE,
-    )
-    if m:
-        peak = parse_currency_or_flag(m.group(1))
+    Extrai consumo ativo medido (kWh) — ponta e fora de ponta.
 
-    offpeak = None
-    m = re.search(
+    Cobre dois formatos de fatura distintos:
+      a) Enel SP / formato ANEEL antigo: "CONSUMO ATIVO PONTA TE/TUSD \\n KWH \\n <qty>"
+      b) CEMIG NF-e / formato moderno:   "Consumo de energia elétrica HP \\n kWh \\n <qty>"
+
+    Retorna (consumo_ponta_kwh, consumo_fora_ponta_kwh); cada um pode ser
+    None (rótulo ausente), float (extraído) ou READ_ERROR_SENTINEL (rótulo
+    encontrado, valor ilegível).
+
+    Nota: quando o mesmo consumo aparece em mais de uma linha de detalhe
+    tarifário (ex: TE + TUSD = dois itens "CONSUMO ATIVO PONTA"), ambas têm
+    a mesma quantidade — usamos o primeiro match para evitar dupla contagem.
+    """
+    # --- Ponta (HP) ---
+    # Padrão a) Enel SP: CONSUMO ATIVO PONTA TE/TUSD
+    _PEAK_PATTERNS = [
+        r"CONSUMO\s+ATIVO\s+PONTA\s+(?:TE|TUSD)\s*\n?\s*KWH\s*\n?\s*([\d.,]+)",
+        # Padrão b) CEMIG NF-e: "Consumo de energia elétrica HP" (linha-por-linha ou inline)
+        r"Consumo\s+de\s+energia\s+el[eé]trica\s+HP\b[^\n]*\n?\s*[Kk][Ww][Hh]\s*[\n\r]*\s*([\d.,]+)",
+        r"Consumo\s+de\s+energia\s+el[eé]trica\s+HP\b\s+[Kk][Ww][Hh]\s+([\d.,]+)",
+    ]
+    peak = None
+    for p in _PEAK_PATTERNS:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            peak = parse_currency_or_flag(m.group(1))
+            break
+
+    # --- Fora de Ponta (HFP) ---
+    _OFFPEAK_PATTERNS = [
         r"CONSUMO\s+ATIVO\s+F\.?\s*PONTA\s+(?:TE|TUSD)\s*\n?\s*KWH\s*\n?\s*([\d.,]+)",
-        text, re.IGNORECASE,
-    )
-    if m:
-        offpeak = parse_currency_or_flag(m.group(1))
+        # Padrão b) CEMIG NF-e: "Consumo de energia elétrica HFP"
+        r"Consumo\s+de\s+energia\s+el[eé]trica\s+HFP\b[^\n]*\n?\s*[Kk][Ww][Hh]\s*[\n\r]*\s*([\d.,]+)",
+        r"Consumo\s+de\s+energia\s+el[eé]trica\s+HFP\b\s+[Kk][Ww][Hh]\s+([\d.,]+)",
+    ]
+    offpeak = None
+    for p in _OFFPEAK_PATTERNS:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            offpeak = parse_currency_or_flag(m.group(1))
+            break
+
+    return peak, offpeak
+
+
+def extract_third_party_energy_kwh(text: str) -> tuple[float | str | None, float | str | None]:
+    """
+    Extrai energia adquirida de comercializadora (ACL), separada por período
+    tarifário — presente somente em faturas DISTRIBUIDORA_MLE onde a energia
+    da comercializadora aparece como crédito/abatimento.
+
+    Rótulos buscados: "Energia Terc Comercializad HP" e "... HFP"
+    (a quantidade em kWh é sempre positiva; o valor R$ pode ser negativo
+    porque representa um abatimento no débito total da fatura).
+
+    Retorna (ponta_kwh, fora_ponta_kwh).
+    """
+    _PEAK_TERC_PATTERNS = [
+        r"Energia\s+Terc[a-z]*\s+Comercializad[a-z]*\s+HP\b[^\n]*\n?\s*[Kk][Ww][Hh]\s*[\n\r]*\s*(-?[\d.,]+)",
+        r"Energia\s+Terc[a-z]*\s+Comercializad[a-z]*\s+HP\b\s+[Kk][Ww][Hh]\s+(-?[\d.,]+)",
+        r"ENERGIA\s+TERC[^\n]*HP\b[^\n]*\n?\s*[Kk][Ww][Hh]\s*[\n\r]*\s*(-?[\d.,]+)",
+    ]
+    peak = None
+    for p in _PEAK_TERC_PATTERNS:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            raw = parse_currency_or_flag(m.group(1))
+            peak = abs(raw) if isinstance(raw, float) else raw
+            break
+
+    _OFFPEAK_TERC_PATTERNS = [
+        r"Energia\s+Terc[a-z]*\s+Comercializad[a-z]*\s+HFP\b[^\n]*\n?\s*[Kk][Ww][Hh]\s*[\n\r]*\s*(-?[\d.,]+)",
+        r"Energia\s+Terc[a-z]*\s+Comercializad[a-z]*\s+HFP\b\s+[Kk][Ww][Hh]\s+(-?[\d.,]+)",
+        r"ENERGIA\s+TERC[^\n]*HFP\b[^\n]*\n?\s*[Kk][Ww][Hh]\s*[\n\r]*\s*(-?[\d.,]+)",
+    ]
+    offpeak = None
+    for p in _OFFPEAK_TERC_PATTERNS:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            raw = parse_currency_or_flag(m.group(1))
+            offpeak = abs(raw) if isinstance(raw, float) else raw
+            break
 
     return peak, offpeak
 

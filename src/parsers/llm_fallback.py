@@ -77,6 +77,10 @@ não se limite apenas aos prioritários:
   com os componentes da fatura de energia (TUSD, Tarifa de Energia, Demanda Ponta/Fora Ponta,
   ICMS, PIS, COFINS, etc.) ou itens/serviços de nota fiscal; até 10 itens, sem omitir nenhum
 - consumer_unit: string (código da unidade consumidora / código de instalação / número do ponto de entrega)
+- consumption_peak_kwh: number (consumo de energia elétrica na Hora de Ponta — HP, em kWh)
+- consumption_offpeak_kwh: number (consumo de energia elétrica na Hora Fora de Ponta — HFP, em kWh)
+- third_party_energy_peak_kwh: number (Energia Terc. Comercializada HP — ACL/MLE, em kWh; somente em fatura de distribuidora MLE)
+- third_party_energy_offpeak_kwh: number (Energia Terc. Comercializada HFP — ACL/MLE, em kWh; somente em fatura de distribuidora MLE)
 
 {context_section}Texto da fatura (até 6000 caracteres):
 ---
@@ -298,7 +302,11 @@ class LLMFallback:
 
 _SUPPLIER_FIELDS = {"supplier_name", "supplier_cnpj", "supplier_cpf", "supplier_state"}
 _CUSTOMER_FIELDS = {"customer_name", "customer_cnpj", "customer_cpf", "customer_state"}
-_ENERGY_FIELDS   = {"consumer_unit", "line_items"}
+_ENERGY_FIELDS   = {
+    "consumer_unit", "line_items",
+    "consumption_peak_kwh", "consumption_offpeak_kwh",
+    "third_party_energy_peak_kwh", "third_party_energy_offpeak_kwh",
+}
 
 _SUPPLIER_SECTION_KEYS = {"emitente", "fornecedor", "remetente", "vendedor", "prestador"}
 _CUSTOMER_SECTION_KEYS = {"destinatario", "destinatário", "cliente", "tomador", "comprador"}
@@ -444,5 +452,16 @@ def _merge(invoice: Invoice, data: dict) -> Invoice:
     # Unidade consumidora (código de instalação/ponto de entrega)
     if not invoice.energy.consumer_unit and data.get("consumer_unit"):
         invoice.energy.consumer_unit = str(data["consumer_unit"])
+
+    # Métricas de consumo de energia (kWh) — HP / HFP e energia terceirizada
+    _energy_kwh_fields = [
+        "consumption_peak_kwh",
+        "consumption_offpeak_kwh",
+        "third_party_energy_peak_kwh",
+        "third_party_energy_offpeak_kwh",
+    ]
+    for _ef in _energy_kwh_fields:
+        if getattr(invoice.energy, _ef) is None and data.get(_ef) is not None:
+            setattr(invoice.energy, _ef, _as_float(data[_ef]))
 
     return invoice

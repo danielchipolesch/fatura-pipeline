@@ -129,6 +129,11 @@ class EnergyMetrics(BaseModel):
     demand_overage_value: NumericValue = None         # Valor (R$) de ultrapassagem de demanda contratada
     reactive_penalty_peak_value: NumericValue = None      # Valor (R$) da multa reativa (UFER) na ponta
     reactive_penalty_offpeak_value: NumericValue = None   # Valor (R$) da multa reativa (UFER) fora de ponta
+    # Energia adquirida de comercializadora (ACL) — só presente em faturas
+    # DISTRIBUIDORA_MLE; representa o crédito de energia injetada pela
+    # comercializadora, listado como abatimento na fatura da distribuidora.
+    third_party_energy_peak_kwh: NumericValue = None      # Energia Terc. Comercializad HP (kWh)
+    third_party_energy_offpeak_kwh: NumericValue = None   # Energia Terc. Comercializad HFP (kWh)
 
 
 class Invoice(BaseModel):

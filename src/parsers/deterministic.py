@@ -32,6 +32,7 @@ from src.extractors.fields import (
     extract_client_number,
     extract_consumer_unit,
     extract_consumption_kwh,
+    extract_third_party_energy_kwh,
     extract_cpf,
     extract_currency,
     extract_date,
@@ -526,6 +527,48 @@ def _extract_line_items_from_text(text: str, layout: InvoiceLayout) -> list[Line
 
 
 # ---------------------------------------------------------------------------
+# Bridge: line_items → energy (normalização)
+# ---------------------------------------------------------------------------
+
+# Mapeamento: padrão de descrição → (campo_peak, campo_offpeak)
+# Cada tupla contém o atributo de EnergyMetrics que deve ser preenchido.
+_ENERGY_BRIDGE_RULES: list[tuple[re.Pattern, str]] = [
+    # CEMIG NF-e
+    (re.compile(r"consumo\s+de\s+energia\s+el[eé]trica\s+hfp\b", re.IGNORECASE), "consumption_offpeak_kwh"),
+    (re.compile(r"consumo\s+de\s+energia\s+el[eé]trica\s+hp\b",  re.IGNORECASE), "consumption_peak_kwh"),
+    (re.compile(r"energia\s+terc[a-z]*\s+comercializad[a-z]*\s+hfp\b", re.IGNORECASE), "third_party_energy_offpeak_kwh"),
+    (re.compile(r"energia\s+terc[a-z]*\s+comercializad[a-z]*\s+hp\b",  re.IGNORECASE), "third_party_energy_peak_kwh"),
+    # Enel SP / formato ANEEL antigo
+    (re.compile(r"consumo\s+ativo\s+f\.?\s*ponta", re.IGNORECASE), "consumption_offpeak_kwh"),
+    (re.compile(r"consumo\s+ativo\s+ponta",         re.IGNORECASE), "consumption_peak_kwh"),
+]
+
+
+def _sync_energy_from_items(line_items: list, energy) -> None:
+    """
+    Espelha dados de consumo de `line_items` em `energy` quando o extrator
+    de texto não conseguiu preencher o campo (ex: PDF sem OCR onde o Docling
+    capturou a tabela mas o texto plano não tinha o rótulo esperado).
+
+    Só preenche campos que ainda estão null — nunca sobrescreve resultados
+    do extrator de texto, que tem maior confiabilidade de posicionamento.
+    Quantidade negativa (créditos de "Energia Terc.") é armazenada como
+    valor absoluto, pois o campo representa magnitude de energia.
+    """
+    for item in line_items:
+        desc = item.description or ""
+        for pattern, field in _ENERGY_BRIDGE_RULES:
+            if not pattern.search(desc):
+                continue
+            if getattr(energy, field) is not None:
+                break  # já preenchido pelo extrator de texto
+            qty = item.quantity
+            if isinstance(qty, (int, float)) and qty != 0:
+                setattr(energy, field, abs(qty))
+            break
+
+
+# ---------------------------------------------------------------------------
 # Parser principal
 # ---------------------------------------------------------------------------
 
@@ -782,6 +825,9 @@ class DeterministicParser:
             demand_overage_value=extract_demand_overage_value(text),
         )
         energy.consumption_peak_kwh, energy.consumption_offpeak_kwh = extract_consumption_kwh(text)
+        tp_peak, tp_offpeak = extract_third_party_energy_kwh(text)
+        energy.third_party_energy_peak_kwh = tp_peak
+        energy.third_party_energy_offpeak_kwh = tp_offpeak
         reactive = extract_reactive_excess(text)
         energy.reactive_energy_excess_peak_kwh = reactive["peak_kwh"]
         energy.reactive_energy_excess_offpeak_kwh = reactive["offpeak_kwh"]
@@ -812,6 +858,12 @@ class DeterministicParser:
                     if isinstance(q, (int, float)) and 0 < q < 99999:
                         energy.consumption_offpeak_kwh = q
                         break
+
+        # Bridge: espelha line_items → energy para campos ainda null.
+        # Garante que a mesma informação (ex: "Consumo de energia elétrica HFP")
+        # sempre popula `energy`, independente de o Docling ter capturado via
+        # tabela (→ line_items) ou via texto plano (→ regex acima).
+        _sync_energy_from_items(line_items, energy)
 
         invoice = Invoice(
             invoice_number=invoice_number,
