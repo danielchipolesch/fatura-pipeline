@@ -386,12 +386,17 @@ class DoclingExtractor:
                 r"C[ÓO]D(?:IGO)?\.?\s*INSTALA[ÇC][ÃA]O",
                 r"N[ºo°]\.?\s*(?:DA\s+)?INSTALA[ÇC][ÃA]O",
             ]
+            _DATE_RE = re.compile(r"\d{2}[/\-]\d{2}[/\-]\d{4}")
             for label_pattern in uc_labels:
                 val_text = _spatial_right_or_below(
                     content.spatial_index, label_pattern,
                     value_pattern=r"[\d][\d.\-/]*",
                 )
-                if val_text and len(re.sub(r"[^\d]", "", val_text)) >= 4:
+                if (
+                    val_text
+                    and len(re.sub(r"[^\d]", "", val_text)) >= 4
+                    and not _DATE_RE.search(val_text)
+                ):
                     result["consumer_unit"] = val_text
                     break
 
