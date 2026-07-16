@@ -631,6 +631,11 @@ def _extract_energy_items_from_text(text: str) -> list[LineItem]:
             if total is None and len(inline_nums) >= 3:
                 total = inline_nums[2]
 
+            # Sanity check: MWh qty não deve ultrapassar 99 999 (mesmo limite
+            # de extract_energy_quantity_mwh) — evita capturar IEs ou totais.
+            if canonical_unit == "MWh" and isinstance(qty, float) and qty > 99_999:
+                qty = None
+
             if qty is not None or total is not None:
                 items.append(LineItem(
                     description=canonical_desc,
@@ -913,16 +918,24 @@ class DeterministicParser:
         consumer_unit = pre.get("consumer_unit") or extract_consumer_unit(text)
         client_number = extract_client_number(text)
 
-        # NF-e de comercializadora sem line_items: cria item a partir da
-        # quantidade em MWh encontrada no texto (QUANT. / coluna de tabela invertida).
-        if layout == InvoiceLayout.NFE and not line_items:
+        # NF-e de comercializadora: tenta preencher qty MWh via padrão dedicado
+        # (funciona mesmo quando _extract_energy_items_from_text criou o item mas
+        # não conseguiu capturar a quantidade porque ela estava em outra posição).
+        if layout == InvoiceLayout.NFE:
             mwh = extract_energy_quantity_mwh(text)
             if mwh is not None:
-                line_items = [LineItem(
-                    description="Energia Elétrica",
-                    unit="MWh",
-                    quantity=mwh,
-                )]
+                filled = False
+                for _item in line_items:
+                    if _item.unit in ("MWh", "MWH") and _item.quantity is None:
+                        _item.quantity = mwh
+                        filled = True
+                        break
+                if not filled and not line_items:
+                    line_items = [LineItem(
+                        description="Energia Elétrica",
+                        unit="MWh",
+                        quantity=mwh,
+                    )]
 
         invoice = Invoice(
             invoice_number=invoice_number,
