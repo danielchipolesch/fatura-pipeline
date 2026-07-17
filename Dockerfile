@@ -52,7 +52,7 @@ print('PaddleOCR ready')" \
 
 COPY src/ ./src/
 
-RUN mkdir -p /app/input /app/output /app/logs
+RUN mkdir -p /app/input /app/output/json /app/output/xlsx /app/output/csv /app/logs
 
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1

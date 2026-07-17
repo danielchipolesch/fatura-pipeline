@@ -524,19 +524,25 @@ def _extract_line_items_from_text(text: str, layout: InvoiceLayout) -> list[Line
 # ---------------------------------------------------------------------------
 
 # Mapeamento label → (descrição canônica, unidade) para itens de energia.
-# Quando o Docling não extrai a tabela de produtos/serviços, tentamos
-# identificar as linhas pelo rótulo e reconstruir o LineItem.
+# Ordenado do mais específico para o mais genérico: padrões mais específicos
+# vêm primeiro para que claimed_lines impeça o genérico de re-capturar a linha.
+# Unidade vazia ("") indica item sem qty/unit_price — só total (ex: CIP, tributos).
 _ENERGY_ITEM_PATTERNS: list[tuple[re.Pattern, str, str]] = [
-    # CEMIG NF-e / NF3E
+    # CEMIG NF-e / NF3E — Consumo HP/HFP
     (re.compile(r"Consumo\s+de\s+energia\s+el[eé]trica\s+HFP\b", re.IGNORECASE),
      "Consumo de energia elétrica HFP", "kWh"),
     (re.compile(r"Consumo\s+de\s+energia\s+el[eé]trica\s+HP\b", re.IGNORECASE),
      "Consumo de energia elétrica HP",  "kWh"),
+    (re.compile(r"Energia\s+Ativa\s+HFP\b", re.IGNORECASE),
+     "Energia Ativa HFP", "kWh"),
+    (re.compile(r"Energia\s+Ativa\s+HP\b", re.IGNORECASE),
+     "Energia Ativa HP", "kWh"),
+    # Energia terceirizada — DISTRIBUIDORA_MLE
     (re.compile(r"Energia\s+Terc[a-z]*\s+Comercializad[a-z]*\s+HFP\b", re.IGNORECASE),
      "Energia Terc Comercializad HFP", "kWh"),
     (re.compile(r"Energia\s+Terc[a-z]*\s+Comercializad[a-z]*\s+HP\b", re.IGNORECASE),
      "Energia Terc Comercializad HP",  "kWh"),
-    # TUSD e TE (rótulo genérico sem HP/HFP — alguns layouts abreviam)
+    # TUSD e TE com HP/HFP
     (re.compile(r"TUSD\s+(?:HP|Hora\s+de\s+Ponta)\b", re.IGNORECASE),
      "TUSD HP", "kWh"),
     (re.compile(r"TUSD\s+(?:HFP|F\.?\s*Ponta|Hora\s+Fora\s+de\s+Ponta)\b", re.IGNORECASE),
@@ -545,27 +551,243 @@ _ENERGY_ITEM_PATTERNS: list[tuple[re.Pattern, str, str]] = [
      "TE HP", "kWh"),
     (re.compile(r"\bTE\s+(?:HFP|F\.?\s*Ponta|Hora\s+Fora\s+de\s+Ponta)\b", re.IGNORECASE),
      "TE HFP", "kWh"),
-    # Enel SP / ANEEL antigo
+    # Demanda — mais específico primeiro para não conflitar com genérico
+    (re.compile(r"Demanda\s+Ativa\b(?!\s+Ultrapassagem)", re.IGNORECASE),
+     "Demanda Ativa", "kW"),
+    (re.compile(r"Demanda\s+(?:Ativa\s+)?Ultrapassagem\b", re.IGNORECASE),
+     "Demanda Ultrapassagem", "kW"),
+    (re.compile(r"ULTRAPASSAGEM\s+DEMANDA\b", re.IGNORECASE),
+     "Ultrapassagem Demanda", "kW"),
+    (re.compile(r"Demanda\s+Reativa\s+Excedente\b", re.IGNORECASE),
+     "Demanda Reativa Excedente", "kVAR"),
+    # Consumo Reativo — antes do Consumo Ativo
+    (re.compile(r"Consumo\s+Reativo\s+Exc\w*\.?\s+(?:Na\s+)?Ponta\b", re.IGNORECASE),
+     "Consumo Reativo Exc. Ponta", "kVARh"),
+    (re.compile(r"Consumo\s+Reativo\s+Exc\w*\.?\s+Fora\s+(?:da?\s+)?Ponta\b", re.IGNORECASE),
+     "Consumo Reativo Exc. Fora de Ponta", "kVARh"),
+    # Consumo Ativo — Enel SP com sufixo TE/TUSD
     (re.compile(r"CONSUMO\s+ATIVO\s+PONTA\s+(?:TE|TUSD)\b", re.IGNORECASE),
      "Consumo Ativo Ponta", "kWh"),
     (re.compile(r"CONSUMO\s+ATIVO\s+F\.?\s*PONTA\s+(?:TE|TUSD)\b", re.IGNORECASE),
      "Consumo Ativo Fora de Ponta", "kWh"),
-    # Demanda e reativo
-    (re.compile(r"\bDEMANDA\b(?!\s+CONTRAT)", re.IGNORECASE),
+    # Consumo Ativo — COPEL/CEEE/genérico (sem TUSD/TE; suporta "Na Ponta")
+    (re.compile(r"Consumo\s+Ativo\s+(?:Na\s+)?Ponta\b", re.IGNORECASE),
+     "Consumo Ativo Ponta", "kWh"),
+    (re.compile(r"Consumo\s+Ativo\s+(?:Fora\s+(?:da?\s+)?Ponta|F\.?\s*Ponta)\b", re.IGNORECASE),
+     "Consumo Ativo Fora de Ponta", "kWh"),
+    # Demanda genérica (após os específicos — lookahead exclui Ativa/Reativa/Máxima)
+    (re.compile(r"\bDEMANDA\b(?!\s+(?:ATIVA|REATIVA|CONTRAT|M[AÁ]XIMA))", re.IGNORECASE),
      "Demanda", "kW"),
-    (re.compile(r"ULTRAPASSAGEM\s+DEMANDA\b", re.IGNORECASE),
-     "Ultrapassagem Demanda", "kW"),
-    (re.compile(r"UFER\s+PONTA\b", re.IGNORECASE),
-     "UFER Ponta", "kWh"),
-    (re.compile(r"UFER\s+(?:F\.?\s*PONTA|HFP)\b", re.IGNORECASE),
-     "UFER Fora de Ponta", "kWh"),
-    # Comercializadora
+    # UFER
+    (re.compile(r"UFER\s+PONTA\b", re.IGNORECASE), "UFER Ponta", "kWh"),
+    (re.compile(r"UFER\s+(?:F\.?\s*PONTA|HFP)\b", re.IGNORECASE), "UFER Fora de Ponta", "kWh"),
+    # CIP e tributos sem qty/unit_price (unidade "" → apenas total)
+    (re.compile(r"Contrib\.?\s+Ilum\.?\s+P[úu]bl", re.IGNORECASE),
+     "Contrib. Iluminação Pública Municipal", ""),
+    (re.compile(r"ICMS\s+Subven[çc][ãa]o\b", re.IGNORECASE),
+     "ICMS Subvenção", ""),
+    (re.compile(r"\bTributo\s+Federal\b", re.IGNORECASE),
+     "Tributo Federal", ""),
+    # Comercializadora — Energia Elétrica MWh (fallback de último recurso)
     (re.compile(r"ENERGIA\s+EL[ÉE]TRICA\b", re.IGNORECASE),
      "Energia Elétrica", "MWh"),
 ]
 
-_NUM = r"-?[\d.,]+"  # número (possivelmente negativo)
-_NUM_POS = r"[\d.,]+"  # número positivo
+_NUM = r"-?[\d.,]+"   # número (possivelmente negativo)
+_BANDEIRA_RE = re.compile(r"^BANDEIRA\s+(\w+)\s*$", re.IGNORECASE)
+_BANDEIRA_INLINE_RE = re.compile(r"BANDEIRA\s+(\w+)", re.IGNORECASE)
+
+# Seções de texto que NÃO contêm itens de faturamento
+_SKIP_SECTION_HEADERS = frozenset(["gráficos", "tarifas aplicadas", "graficos"])
+
+
+def _parse_compound_description_line(line_idx: int, lines: list[str]) -> list[LineItem]:
+    """
+    Parseia uma linha composta onde múltiplas descrições de item estão concatenadas
+    (sem dígitos), seguida de linhas de valores.
+
+    Suporta dois formatos de bloco de valores:
+      Simples  : cada item tem qty, price, total em linhas individuais separadas.
+      Agrupado : quantidades empilhadas em uma linha; totais agrupados em outra linha
+                 com múltiplos valores; preços em linhas individuais.
+    """
+    line = lines[line_idx].strip()
+
+    # Extrai itens em ordem textual (esquerda → direita), rastreando BANDEIRA
+    ordered_items: list[tuple[str, str, str | None]] = []
+    current_bandeira: str | None = None
+    pos = 0
+    while pos < len(line):
+        # Verifica marcador de BANDEIRA na posição atual
+        bm = re.match(r"BANDEIRA\s+(\w+)", line[pos:], re.IGNORECASE)
+        if bm:
+            current_bandeira = bm.group(1).upper()
+            pos += bm.end()
+            continue
+
+        # Encontra o padrão mais próximo a partir de pos
+        best_start = len(line) + 1
+        best_m = None
+        best_data: tuple[str, str] | None = None
+        for pat, cdesc, cunit in _ENERGY_ITEM_PATTERNS:
+            m = pat.search(line, pos)
+            if m and m.start() < best_start:
+                best_start = m.start()
+                best_m = m
+                best_data = (cdesc, cunit)
+
+        if best_m is None:
+            break
+
+        # Atualiza bandeira com qualquer marcador entre pos e o match
+        between = line[pos:best_m.start()]
+        for bm2 in _BANDEIRA_INLINE_RE.finditer(between):
+            current_bandeira = bm2.group(1).upper()
+
+        cdesc, cunit = best_data
+        ordered_items.append((cdesc, cunit, current_bandeira))
+        pos = best_m.end()
+
+    if len(ordered_items) < 3:
+        return []
+
+    # Separa itens com unidade dos itens "só total" (CIP, ICMS Sub, Tributo)
+    unit_items = [(cd, cu, ab) for cd, cu, ab in ordered_items if cu != ""]
+    total_only_items = [(cd, ab) for cd, cu, ab in ordered_items if cu == ""]
+
+    # Coleta linhas de valores após a linha composta (para quando encontrar
+    # cabeçalho de texto puro sem dígitos)
+    value_lines: list[list[float]] = []
+    for j in range(line_idx + 1, min(line_idx + 60, len(lines))):
+        ln = lines[j].strip()
+        if not ln:
+            continue
+        if re.match(r"^[A-ZÁÉÍÓÚÀÂÊÔÃÕÇ]{4,}", ln) and not re.search(r"\d", ln):
+            break
+        nums: list[float] = []
+        for tok in re.split(r"\s+", ln):
+            n = parse_currency(tok)
+            if n is not None:
+                nums.append(n)
+        if nums:
+            value_lines.append(nums)
+
+    if not value_lines:
+        return []
+
+    results: list[tuple[str, str, str | None, float | None, float | None, float | None]] = []
+    extra_totals: list[float] = []
+
+    vl_idx = 0
+    item_idx = 0
+
+    while item_idx < len(unit_items) and vl_idx < len(value_lines):
+        vl = value_lines[vl_idx]
+        vl_idx += 1
+
+        if len(vl) == 1:
+            # Linha de valor único → qty do item atual (modo simples)
+            cd, cu, ab = unit_items[item_idx]
+            qty = vl[0]
+            price = total = None
+            while vl_idx < len(value_lines):
+                next_vl = value_lines[vl_idx]
+                if len(next_vl) == 1:
+                    if price is None:
+                        price = next_vl[0]
+                        vl_idx += 1
+                    elif total is None:
+                        total = next_vl[0]
+                        vl_idx += 1
+                        break
+                    else:
+                        break
+                else:
+                    break  # linha multi-valor → pertence ao próximo grupo
+            results.append((cd, cu, ab, qty, price, total))
+            item_idx += 1
+
+        else:
+            # Linha multi-valor → quantidades empilhadas de N itens consecutivos
+            N_vals = len(vl)
+            stacked = unit_items[item_idx: item_idx + N_vals]
+            N = len(stacked)
+            qtys = vl[:N]
+
+            prices: list[float | None] = [None] * N
+            totals: list[float | None] = [None] * N
+            price_idx = 0
+            total_idx = 0
+            combined_totals = False
+
+            while (total_idx < N or price_idx < N) and vl_idx < len(value_lines):
+                next_vl = value_lines[vl_idx]
+
+                if len(next_vl) == 1:
+                    if combined_totals:
+                        # Modo B: totais já agrupados → lê preços restantes
+                        while price_idx < N and prices[price_idx] is not None:
+                            price_idx += 1
+                        if price_idx < N:
+                            prices[price_idx] = next_vl[0]
+                            price_idx += 1
+                        vl_idx += 1
+                    else:
+                        # Modo A: alternado [price, total, price, total, …]
+                        if price_idx == total_idx:
+                            prices[price_idx] = next_vl[0]
+                            price_idx += 1
+                        else:
+                            totals[total_idx] = next_vl[0]
+                            total_idx += 1
+                        vl_idx += 1
+                else:
+                    # Linha multi-valor durante o grupo → linha de totais agrupados
+                    needed = N - total_idx
+                    for k in range(min(needed, len(next_vl))):
+                        totals[total_idx + k] = next_vl[k]
+                    total_idx = N
+                    if len(next_vl) > needed:
+                        extra_totals = list(next_vl[needed:])
+                    vl_idx += 1
+                    combined_totals = True
+                    if price_idx >= N:
+                        break
+
+            for k, (cd, cu, ab) in enumerate(stacked):
+                qty = qtys[k] if k < len(qtys) else None
+                if cu == "MWh" and isinstance(qty, float) and qty > 99_999:
+                    qty = None
+                results.append((cd, cu, ab, qty, prices[k], totals[k]))
+
+            item_idx += N
+
+    # Itens sem unidade: totais vêm da linha de totais agrupados ou da maior linha
+    if total_only_items:
+        if not extra_totals:
+            for vl in value_lines:
+                if len(vl) >= len(total_only_items):
+                    extra_totals = list(vl[-len(total_only_items):])
+                    break
+        if extra_totals:
+            for k, (cd, ab) in enumerate(total_only_items):
+                if k < len(extra_totals):
+                    results.append((cd, "", ab, None, None, abs(extra_totals[k])))
+
+    # Converte para LineItem
+    items: list[LineItem] = []
+    for cd, cu, ab, qty, price, total in results:
+        if qty is None and total is None:
+            continue
+        desc = f"{cd} (Bandeira {ab.title()})" if ab else cd
+        items.append(LineItem(
+            description=desc,
+            unit=cu or None,
+            quantity=abs(qty) if isinstance(qty, float) else qty,
+            unit_price=price,
+            total=total,
+        ))
+    return items
 
 
 def _extract_energy_items_from_text(text: str) -> list[LineItem]:
@@ -573,44 +795,106 @@ def _extract_energy_items_from_text(text: str) -> list[LineItem]:
     Extrai itens de fatura de energia a partir do texto plano quando o
     Docling não capturou a tabela de produtos/serviços.
 
-    Estrutura esperada (linha-por-linha):
-      <RÓTULO DO ITEM>
-      <UNIDADE>
-      <QUANTIDADE>
-      <PREÇO UNITÁRIO>
-      <VALOR TOTAL>
+    Formatos suportados:
+      Inline  : <RÓTULO[(UNID)]>  <QTY>  <UNIT_PRICE>  <TOTAL>  (tudo na mesma linha)
+      Vertical: <RÓTULO> / <UNID> / <QTY> / <UNIT_PRICE> / <TOTAL>  (linhas separadas)
+      Total-only: <RÓTULO>  <TOTAL>  (itens sem qty/unit_price: CIP, ICMS Subvenção)
 
-    Também lida com o formato inline:
-      <RÓTULO> <UNIDADE> <QUANTIDADE> <PREÇO> <VALOR>
+    Bandeiras tarifárias (BANDEIRA VERMELHA / AMARELA) são rastreadas por linha
+    para distinguir itens com o mesmo rótulo mas tarifa diferente.
     """
     items: list[LineItem] = []
-    seen_descs: set[str] = set()
+    seen_descs: set[tuple] = set()   # (canonical_desc, bandeira) — deduplicação
+    claimed_lines: set[int] = set()  # evita que padrão genérico recapture linha já extraída
 
     lines = text.splitlines()
 
+    # Pré-computa o contexto de bandeira vigente em cada linha
+    bandeira_per_line: list[str | None] = [None] * len(lines)
+    _current_bandeira: str | None = None
+    for idx, ln in enumerate(lines):
+        m = _BANDEIRA_RE.match(ln.strip())
+        if m:
+            _current_bandeira = m.group(1).upper()
+        bandeira_per_line[idx] = _current_bandeira
+
+    # Marca linhas em seções não-faturamento (GRÁFICOS, TARIFAS APLICADAS)
+    skip_lines: set[int] = set()
+    in_skip_section = False
+    for idx, ln in enumerate(lines):
+        stripped_lower = ln.strip().lower()
+        if stripped_lower in _SKIP_SECTION_HEADERS:
+            in_skip_section = True
+            skip_lines.add(idx)
+            continue
+        # Próximo cabeçalho de seção em caixa alta sem dígitos encerra a seção de skip
+        if in_skip_section:
+            if re.match(r"^[A-ZÁÉÍÓÚÀÂÊÔÃÕÇ]{4,}", ln.strip()) and not re.search(r"\d", ln):
+                if stripped_lower not in _SKIP_SECTION_HEADERS:
+                    in_skip_section = False
+                    # Não adiciona essa linha ao skip (pode ser início de nova seção válida)
+                    continue
+            skip_lines.add(idx)
+
+    # Detecta e parseia linhas compostas ANTES do loop principal
+    # (linhas sem valores numéricos válidos que contenham 3+ padrões de energia).
+    # Usa parse_currency para distinguir valores reais de códigos/datas ("083217793-30/10/19").
+    for idx, ln in enumerate(lines):
+        if idx in skip_lines:
+            continue
+        # Linha composta não contém valores numéricos "parseáveis" (qty/price/total)
+        if any(parse_currency(tok) is not None
+               for tok in re.split(r"\s+", ln.strip()) if tok):
+            continue
+        stripped = ln.strip()
+        if not stripped:
+            continue
+        match_count = sum(1 for pat, _, _ in _ENERGY_ITEM_PATTERNS if pat.search(stripped))
+        if match_count < 3:
+            continue
+        compound_items = _parse_compound_description_line(idx, lines)
+        if compound_items:
+            for ci in compound_items:
+                if ci.quantity is not None or ci.total is not None:
+                    items.append(ci)
+                    desc_key = (ci.description, None)
+                    seen_descs.add(desc_key)
+            claimed_lines.add(idx)
+
     for pattern, canonical_desc, canonical_unit in _ENERGY_ITEM_PATTERNS:
         for i, line in enumerate(lines):
+            if i in claimed_lines:
+                continue
+            if i in skip_lines:
+                continue
             if not pattern.search(line.strip()):
                 continue
-            if canonical_desc in seen_descs:
-                break  # já capturado (evita duplicatas TE + TUSD com mesmo desc)
+
+            active_bandeira = bandeira_per_line[i]
+            desc_key = (canonical_desc, active_bandeira)
+
+            if desc_key in seen_descs:
+                if active_bandeira is None:
+                    break   # item sem bandeira — só existe uma ocorrência; para busca
+                continue    # item com bandeira — pode aparecer de novo com bandeira diferente
 
             qty = unit_price = total = None
-            unit = canonical_unit
+            unit = canonical_unit or None
 
-            # Tenta formato inline: "... kWh 1234,56 0,12345 789,01 ..."
+            # Números inline na própria linha do rótulo
             inline_nums = re.findall(_NUM, line)
             inline_nums = [parse_currency(n) for n in inline_nums if parse_currency(n) is not None]
 
-            # Lê linhas seguintes em busca de qty / price / total
-            for j in range(i + 1, min(i + 6, len(lines))):
+            # Lê até 6 linhas seguintes (formato vertical)
+            for j in range(i + 1, min(i + 7, len(lines))):
                 l = lines[j].strip()
-                if not l or re.match(r"^[A-ZÀ-Ú]{4,}(\s+[A-ZÀ-Ú]+){0,3}$", l):
-                    # Linha em branco ou novo rótulo — para a leitura do bloco
-                    if not re.match(r"^[Kk][Ww][Hh]|^[Mm][Ww]", l):
+                if not l:
+                    break
+                if re.match(r"^[A-ZÀ-Ú]{4,}(\s+[A-ZÀ-Ú]+){0,3}$", l):
+                    if not re.match(r"^[Kk][Ww]|^[Mm][Ww]", l):
                         break
-                # Unidade
-                if re.match(r"^[Kk][Ww][Hh]$|^[Mm][Ww][Hh]?$|^[Kk][Ww]$", l, re.IGNORECASE):
+                if re.match(r"^[Kk][Ww][Hh]$|^[Mm][Ww][Hh]?$|^[Kk][Ww]$|^[Kk][Vv][Aa][Rr][Hh]?$",
+                            l, re.IGNORECASE):
                     unit = l.upper()
                     continue
                 n = parse_currency(l)
@@ -623,28 +907,50 @@ def _extract_energy_items_from_text(text: str) -> list[LineItem]:
                 elif total is None:
                     total = n
 
-            # Fallback inline: usa os números da linha original se não achou nos seguintes
-            if qty is None and len(inline_nums) >= 1:
-                qty = inline_nums[0]
-            if unit_price is None and len(inline_nums) >= 2:
-                unit_price = inline_nums[1]
-            if total is None and len(inline_nums) >= 3:
-                total = inline_nums[2]
+            # Itens sem unidade (CIP, ICMS Subvenção, Tributo Federal):
+            # o único número relevante é o valor total — usa o último número
+            # "razoável" da linha (< 1 000 000) para evitar capturar códigos NF.
+            if canonical_unit == "":
+                reasonable = [n for n in inline_nums if isinstance(n, float) and 0 < n < 1_000_000]
+                total = reasonable[-1] if reasonable else total
+                qty = None
+                unit_price = None
+            else:
+                # Fallback inline para itens com unidade
+                if qty is None and len(inline_nums) >= 1:
+                    qty = inline_nums[0]
+                if unit_price is None and len(inline_nums) >= 2:
+                    unit_price = inline_nums[1]
+                if total is None and len(inline_nums) >= 3:
+                    total = inline_nums[2]
 
-            # Sanity check: MWh qty não deve ultrapassar 99 999 (mesmo limite
-            # de extract_energy_quantity_mwh) — evita capturar IEs ou totais.
+            # Sanity: MWh qty > 99 999 é quase certo um código/IE capturado errado
             if canonical_unit == "MWh" and isinstance(qty, float) and qty > 99_999:
                 qty = None
 
+            # "Energia Elétrica" só é criada se a unidade MWh foi confirmada
+            # (inline "(MWh)" ou linha seguinte) — evita falsos positivos em
+            # cabeçalhos de tabela de contas de concessionária.
+            if canonical_desc == "Energia Elétrica":
+                mwh_confirmed = bool(re.search(r"\bMWh?\b", line, re.IGNORECASE)) or unit == "MWH"
+                if not mwh_confirmed:
+                    continue
+
             if qty is not None or total is not None:
+                # Inclui a bandeira na descrição quando relevante
+                desc = (
+                    f"{canonical_desc} (Bandeira {active_bandeira.title()})"
+                    if active_bandeira else canonical_desc
+                )
                 items.append(LineItem(
-                    description=canonical_desc,
+                    description=desc,
                     unit=unit,
                     quantity=abs(qty) if isinstance(qty, float) else qty,
                     unit_price=unit_price,
                     total=total,
                 ))
-                seen_descs.add(canonical_desc)
+                seen_descs.add(desc_key)
+                claimed_lines.add(i)
 
     return items
 

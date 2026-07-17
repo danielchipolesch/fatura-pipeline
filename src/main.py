@@ -7,9 +7,11 @@ Modos de uso:
   python -m src.main --watch            # modo watch: polling contínuo em /app/input
 
 Saída:
-  /app/output/<nome_sem_ext>.json       # JSON padronizado por arquivo
+  /app/output/json/<nome>.json          # JSON padronizado por arquivo
+  /app/output/xlsx/faturas.xlsx         # XLSX acumulativo com todos as faturas
+  /app/output/csv/faturas.csv           # CSV acumulativo com todos as faturas
+  /app/output/json/.processed_registry.json  # controle de idempotência
   /app/logs/pipeline.log                # log rotativo
-  /app/output/.processed_registry.json # controle de idempotência
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ from loguru import logger
 load_dotenv()
 
 from src.pipeline import FaturaPipeline
+from src.utils.exporters import export_invoice
 from src.utils.helpers import (
     load_processed_registry,
     save_processed_registry,
@@ -36,20 +39,33 @@ from src.utils.helpers import (
 # Configuração
 # ---------------------------------------------------------------------------
 
-_INPUT_DIR = Path(os.getenv("INPUT_DIR", "/app/input"))
+_INPUT_DIR  = Path(os.getenv("INPUT_DIR",  "/app/input"))
 _OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/app/output"))
-_LOGS_DIR = Path(os.getenv("LOGS_DIR", "/app/logs"))
+_LOGS_DIR   = Path(os.getenv("LOGS_DIR",  "/app/logs"))
+
+_JSON_DIR = _OUTPUT_DIR / "json"
+_XLSX_DIR = _OUTPUT_DIR / "xlsx"
+_CSV_DIR  = _OUTPUT_DIR / "csv"
+
+_XLSX_FILE = _XLSX_DIR / "faturas.xlsx"
+_CSV_FILE  = _CSV_DIR  / "faturas.csv"
+
 _POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
-_WATCH_MODE = os.getenv("WATCH_MODE", "false").lower() == "true"
-_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-_REGISTRY_FILE = _OUTPUT_DIR / ".processed_registry.json"
+_WATCH_MODE    = os.getenv("WATCH_MODE", "false").lower() == "true"
+_LOG_LEVEL     = os.getenv("LOG_LEVEL", "INFO")
+
+_REGISTRY_FILE = _JSON_DIR / ".processed_registry.json"
 
 
 def _setup_logging() -> None:
     _LOGS_DIR.mkdir(parents=True, exist_ok=True)
     logger.remove()
-    logger.add(sys.stderr, level=_LOG_LEVEL, colorize=True,
-               format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}")
+    logger.add(
+        sys.stderr,
+        level=_LOG_LEVEL,
+        colorize=True,
+        format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
+    )
     logger.add(
         _LOGS_DIR / "pipeline.log",
         level="DEBUG",
@@ -58,6 +74,11 @@ def _setup_logging() -> None:
         encoding="utf-8",
         format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{line} | {message}",
     )
+
+
+def _ensure_output_dirs() -> None:
+    for d in (_JSON_DIR, _XLSX_DIR, _CSV_DIR):
+        d.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -70,24 +91,30 @@ def _process_file(pdf_path: Path, pipeline: FaturaPipeline, registry: dict) -> N
         logger.debug(f"Já processado (hash idêntico): {pdf_path.name}")
         return
 
-    output_path = _OUTPUT_DIR / (pdf_path.stem + ".json")
-    _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    json_path = _JSON_DIR / (pdf_path.stem + ".json")
 
     try:
         invoice = pipeline.process(pdf_path)
-        write_json(invoice.to_output_dict(), output_path)
-        registry[file_hash] = output_path.name
-        logger.success(f"Salvo: {output_path.name}")
+        invoice_dict = invoice.to_output_dict()
+
+        # 1. JSON individual
+        write_json(invoice_dict, json_path)
+        logger.success(f"JSON salvo: {json_path.name}")
+
+        # 2. XLSX e CSV acumulativos
+        export_invoice(invoice_dict, _XLSX_FILE, _CSV_FILE)
+        logger.success(f"Exportado para XLSX/CSV: {pdf_path.name}")
+
+        registry[file_hash] = json_path.name
 
     except Exception as exc:
         logger.error(f"Erro ao processar '{pdf_path.name}': {exc}")
-        # Salva um JSON de erro para rastreabilidade
         error_payload = {
             "source_file": pdf_path.name,
             "error": str(exc),
             "status": "failed",
         }
-        write_json(error_payload, _OUTPUT_DIR / (pdf_path.stem + ".error.json"))
+        write_json(error_payload, _JSON_DIR / (pdf_path.stem + ".error.json"))
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +134,11 @@ def _run_batch(pipeline: FaturaPipeline, registry: dict) -> None:
         save_processed_registry(registry, _REGISTRY_FILE)
 
 
-def _poll_once(pipeline: FaturaPipeline, registry: dict, known_files: dict[str, tuple[float, int]]) -> None:
+def _poll_once(
+    pipeline: FaturaPipeline,
+    registry: dict,
+    known_files: dict[str, tuple[float, int]],
+) -> None:
     """
     Um ciclo de polling do modo watch.
 
@@ -124,12 +155,12 @@ def _poll_once(pipeline: FaturaPipeline, registry: dict, known_files: dict[str, 
         stat = pdf.stat()
         fingerprint = (stat.st_mtime, stat.st_size)
         if known_files.get(pdf.name) == fingerprint:
-            continue  # já visto nesta versão exata — não precisa nem hashear
+            continue
         new_or_changed.append(pdf)
         known_files[pdf.name] = fingerprint
 
     if not new_or_changed:
-        return  # nada novo neste ciclo — silencioso, sem log
+        return
 
     logger.info(f"{len(new_or_changed)} PDF(s) novo(s)/modificado(s) encontrado(s) para processar")
     for pdf in new_or_changed:
@@ -151,6 +182,7 @@ def _run_watch(pipeline: FaturaPipeline, registry: dict) -> None:
 
 def main() -> None:
     _setup_logging()
+    _ensure_output_dirs()
     logger.info("fatura-pipeline iniciado")
 
     args = sys.argv[1:]
