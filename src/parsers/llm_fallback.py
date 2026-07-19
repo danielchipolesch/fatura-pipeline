@@ -4,12 +4,17 @@ Fallback LLM para campos que o parser determinístico não conseguiu extrair.
 Utiliza Ollama como servidor de LLM open source — sem dependência de APIs externas
 nem contratos comerciais. Os modelos rodam localmente, na infraestrutura da instituição.
 
-Princípios de uso:
-  - Acionado SOMENTE quando confidence_score < CONFIDENCE_THRESHOLD
+Dois modos de uso (configurável via LLM_ENRICH_MODE):
+  - "always" (padrão): enrich_nulls() sempre roda após extração determinística,
+    enviando o JSON parcial + texto bruto ao LLM para preencher apenas campos null.
+  - "threshold": enrich() só é chamado quando confidence_score < CONFIDENCE_THRESHOLD
+    (comportamento original — útil para documentos OCR ou como fallback leve).
+
+Princípios gerais:
+  - Nunca sobrescreve campos já preenchidos pelo parser determinístico
   - Processamento SÍNCRONO por arquivo (sem paralelismo — preserva CPU)
   - O modelo é baixado automaticamente (pull lazy) na primeira chamada
   - Temperatura 0: saída determinística e estruturada em JSON
-  - Nunca deve ser a via primária de extração
 
 Modelos recomendados (configurar LLM_MODEL no .env):
   qwen2.5:3b   — Apache 2.0, multilingual, ~2 GB, padrão
@@ -91,6 +96,53 @@ Contexto específico para os campos prioritários:
 {section_text}
 ---
 
+"""
+
+# Prompts do modo enriquecimento (sempre roda após extração determinística)
+
+_ENRICH_SYSTEM_PROMPT = """\
+Você é um especialista em extração de dados de faturas e documentos fiscais brasileiros.
+Receberá um JSON com dados já extraídos de uma fatura — campos com valor null não foram
+encontrados pelo parser. Sua tarefa é analisar o texto da fatura e preencher APENAS os
+campos null que você conseguir identificar com certeza no texto.
+NÃO altere campos que já possuem valor preenchido.
+Responda SOMENTE com JSON válido. Sem explicações, sem markdown, sem texto extra.
+Se um campo realmente não estiver presente no texto, omita-o do JSON — não invente valores.
+Valores monetários: número decimal (ex: 1234.56 — sem R$ nem separadores de milhar).
+Datas: formato YYYY-MM-DD.
+"""
+
+_ENRICH_USER_TEMPLATE = """\
+Dados já extraídos da fatura (null = não encontrado pelo parser):
+{partial_json}
+
+Preencha apenas os campos null acima que você conseguir identificar no texto abaixo.
+Retorne somente os campos que você vai preencher — omita os que já têm valor ou que
+não foram encontrados no texto.
+
+Campos disponíveis para preenchimento:
+- invoice_number: string
+- issue_date: string YYYY-MM-DD
+- due_date: string YYYY-MM-DD
+- service_period_start: string YYYY-MM-DD
+- service_period_end: string YYYY-MM-DD
+- supplier_name: string
+- supplier_cnpj: string formato XX.XXX.XXX/XXXX-XX
+- supplier_state: sigla UF (ex: MG, SP, PE)
+- customer_name: string
+- customer_cnpj: string formato XX.XXX.XXX/XXXX-XX
+- customer_state: sigla UF
+- consumer_unit: string (código da UC / instalação)
+- client_number: string (número do cliente na concessionária)
+- total: number (valor total a pagar)
+- subtotal: number
+- payment_method: string
+- line_items: lista de {{"description": string, "quantity": number, "unit": string, "unit_price": number, "total": number}}
+
+Texto da fatura (até 6000 caracteres):
+---
+{text}
+---
 """
 
 # ---------------------------------------------------------------------------
@@ -184,6 +236,65 @@ class LLMFallback:
 
         return invoice
 
+    def enrich_nulls(self, invoice: Invoice, content=None) -> Invoice:
+        """
+        Modo enriquecimento: sempre acionado após extração determinística.
+
+        Envia o JSON parcial atual (campos já preenchidos visíveis, nulls explícitos)
+        e o texto bruto ao LLM, que preenche apenas os campos null identificados.
+        Nunca sobrescreve campos já preenchidos pelo parser determinístico.
+        Retorna o invoice inalterado se nenhum campo enriquecível estiver null.
+        """
+        if not self._enabled:
+            return invoice
+
+        null_fields = _get_enrichable_null_fields(invoice)
+        if not null_fields:
+            logger.debug(
+                f"Enriquecimento LLM ignorado para '{invoice.source_file}' — "
+                "nenhum campo null enriquecível"
+            )
+            return invoice
+
+        has_content = content is not None and DocumentContent is not None
+        source_text = (
+            content.markdown if has_content and content.markdown
+            else (invoice.raw_text or "")
+        )
+        if not source_text:
+            return invoice
+
+        logger.info(
+            f"LLM enriquecimento para '{invoice.source_file}' — "
+            f"{len(null_fields)} campo(s) null: {null_fields}"
+        )
+
+        if not self._ensure_model():
+            logger.warning("Modelo indisponível — enriquecimento LLM ignorado.")
+            return invoice
+
+        partial = _build_partial_json(invoice)
+        prompt = _ENRICH_USER_TEMPLATE.format(
+            partial_json=json.dumps(partial, ensure_ascii=False, indent=2, default=str),
+            text=source_text[:6000],
+        )
+
+        try:
+            raw = self._infer(prompt, system=_ENRICH_SYSTEM_PROMPT, num_ctx=8192, num_predict=2048)
+            logger.debug(f"Resposta LLM enriquecimento ({len(raw)} chars): {raw[:200]}")
+            extracted = _parse_json(raw)
+            invoice = _merge(invoice, extracted)
+            invoice.parsing_method = ParsingMethod.HYBRID
+        except requests.exceptions.Timeout:
+            msg = f"Timeout na inferência LLM ({_INFER_TIMEOUT}s) — enriquecimento ignorado."
+            logger.error(msg)
+            invoice.errors.append(msg)
+        except Exception as exc:
+            logger.error(f"LLM enriquecimento falhou: {exc}")
+            invoice.errors.append(f"llm_enrich_error: {exc}")
+
+        return invoice
+
     # ------------------------------------------------------------------
     # Internos
     # ------------------------------------------------------------------
@@ -264,7 +375,13 @@ class LLMFallback:
 
         logger.info(f"Modelo '{self._model}' baixado com sucesso.")
 
-    def _infer(self, user_prompt: str) -> str:
+    def _infer(
+        self,
+        user_prompt: str,
+        system: str = _SYSTEM_PROMPT,
+        num_ctx: int = 4096,
+        num_predict: int = 1024,
+    ) -> str:
         """
         Chama a API de chat do Ollama de forma síncrona e retorna o texto da resposta.
         Usa format='json' para forçar saída JSON válida.
@@ -273,15 +390,15 @@ class LLMFallback:
         payload = {
             "model": self._model,
             "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system},
                 {"role": "user",   "content": user_prompt},
             ],
             "format": "json",   # Força o modelo a retornar JSON válido
             "stream": False,
             "options": {
                 "temperature": 0,
-                "num_predict": 1024,
-                "num_ctx": 4096,
+                "num_predict": num_predict,
+                "num_ctx": num_ctx,
             },
         }
         resp = requests.post(
@@ -345,6 +462,81 @@ def _build_section_context(missing_fields: list[str], content) -> str:
 
     combined = "\n\n".join(sections_needed)
     return _SECTION_CONTEXT_TEMPLATE.format(section_text=combined)
+
+def _get_enrichable_null_fields(invoice: Invoice) -> list[str]:
+    """
+    Retorna os nomes dos campos enriquecíveis (passíveis de preenchimento pelo LLM)
+    que estão atualmente null no invoice. Campos de metadados são excluídos.
+    """
+    null: list[str] = []
+    if not invoice.invoice_number:
+        null.append("invoice_number")
+    if not invoice.issue_date:
+        null.append("issue_date")
+    if not invoice.due_date:
+        null.append("due_date")
+    if not invoice.service_period_start:
+        null.append("service_period_start")
+    if not invoice.service_period_end:
+        null.append("service_period_end")
+    if not invoice.supplier.name:
+        null.append("supplier_name")
+    if not invoice.supplier.cnpj:
+        null.append("supplier_cnpj")
+    if not invoice.supplier.address.state:
+        null.append("supplier_state")
+    if not invoice.customer.name:
+        null.append("customer_name")
+    if not invoice.customer.cnpj:
+        null.append("customer_cnpj")
+    if not invoice.customer.address.state:
+        null.append("customer_state")
+    if not invoice.consumer_unit:
+        null.append("consumer_unit")
+    if not invoice.client_number:
+        null.append("client_number")
+    if invoice.total is None:
+        null.append("total")
+    if invoice.subtotal is None:
+        null.append("subtotal")
+    if not invoice.line_items:
+        null.append("line_items")
+    return null
+
+
+def _build_partial_json(invoice: Invoice) -> dict:
+    """
+    Constrói um dict com os campos enriquecíveis para enviar ao LLM no modo enriquecimento.
+    Campos com valor são incluídos como contexto; campos null aparecem explicitamente como null.
+    """
+    return {
+        "invoice_number": invoice.invoice_number,
+        "issue_date": str(invoice.issue_date) if invoice.issue_date else None,
+        "due_date": str(invoice.due_date) if invoice.due_date else None,
+        "service_period_start": str(invoice.service_period_start) if invoice.service_period_start else None,
+        "service_period_end": str(invoice.service_period_end) if invoice.service_period_end else None,
+        "supplier_name": invoice.supplier.name,
+        "supplier_cnpj": invoice.supplier.cnpj,
+        "supplier_state": invoice.supplier.address.state,
+        "customer_name": invoice.customer.name,
+        "customer_cnpj": invoice.customer.cnpj,
+        "customer_state": invoice.customer.address.state,
+        "consumer_unit": invoice.consumer_unit,
+        "client_number": invoice.client_number,
+        "total": invoice.total,
+        "subtotal": invoice.subtotal,
+        "line_items": [
+            {
+                "description": item.description,
+                "unit": item.unit,
+                "quantity": item.quantity,
+                "unit_price": item.unit_price,
+                "total": item.total,
+            }
+            for item in invoice.line_items
+        ] or None,
+    }
+
 
 def _parse_json(text: str) -> dict:
     """Extrai JSON da resposta, tolerante a markdown code fences."""

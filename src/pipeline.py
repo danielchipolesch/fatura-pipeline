@@ -1,17 +1,21 @@
 """
 Orquestrador do pipeline de extração de faturas.
 
-Fluxo por arquivo (3 camadas de extração):
+Fluxo por arquivo (3 camadas de extração + enriquecimento LLM):
   1. DoclingLoader carrega o PDF → DocumentContent enriquecido
   2. classify_layout() detecta o tipo de fatura
   3. DoclingExtractor (PRIMÁRIO) — usa estrutura semântica nativa do Docling
        (section_map, kv_pairs, spatial_index, page_texts)
-  4. DeterministicParser (FALLBACK) — preenche o que o DoclingExtractor não encontrou
+  4. DeterministicParser (SECUNDÁRIO) — preenche o que o DoclingExtractor não encontrou
        via regex e heurísticas sobre o texto plano
   5. Confidence score é calculado
-  6. Se score < CONFIDENCE_THRESHOLD e houver campos faltantes:
-       LLMFallback.enrich() preenche o que falta (síncrono)
-  7. Invoice validado pelo Pydantic é retornado
+  6. LLM Enriquecimento (LLM_ENRICH_MODE=always, padrão):
+       LLMFallback.enrich_nulls() recebe o JSON parcial + texto bruto do Docling
+       e preenche apenas os campos null — nunca sobrescreve campos já extraídos
+       (documentos OCR continuam usando enrich() com campos forçados)
+  7. Se confidence ainda < CONFIDENCE_THRESHOLD após enriquecimento:
+       LLMFallback.enrich() roda como segunda passagem (garante cobertura OCR)
+  8. Invoice validado pelo Pydantic é retornado
 
 Modo batch (process_batch):
   Agrupa múltiplos PDFs e usa convert_all() com paralelismo nativo do Docling
@@ -40,6 +44,12 @@ from src.parsers.llm_fallback import LLMFallback
 from src.parsers.scanned_preprocessor import ScannedPreprocessor, is_available as _paddle_available
 
 _CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))
+
+# Modo de acionamento do LLM:
+#   "always"    — enriquecimento pós-extração: LLM preenche campos null em toda fatura
+#                 (exceto documentos OCR, que continuam usando o fallback com campos forçados)
+#   "threshold" — comportamento original: LLM só é chamado quando confidence < threshold
+_LLM_ENRICH_MODE = os.getenv("LLM_ENRICH_MODE", "always")
 
 
 class FaturaPipeline:
@@ -206,7 +216,21 @@ class FaturaPipeline:
             f"total={invoice.total}"
         )
 
-        # 5. LLM fallback (somente se necessário)
+        # 5. LLM — modo enriquecimento (always) ou fallback por threshold
+        if _LLM_ENRICH_MODE == "always" and not content.ocr_used:
+            # Enriquecimento pós-extração: LLM preenche apenas campos null.
+            # Documentos OCR ficam de fora (tratados pelo ramo threshold abaixo,
+            # que força reextração de campos potencialmente corrompidos).
+            invoice = self._llm.enrich_nulls(invoice, content=content)
+            invoice.confidence_score = calculate_confidence(invoice)
+            if invoice.parsing_method.value == "hybrid":
+                logger.info(
+                    f"Após LLM enriquecimento — "
+                    f"número={invoice.invoice_number} | "
+                    f"total={invoice.total} | "
+                    f"confidence={invoice.confidence_score:.2f}"
+                )
+
         if invoice.confidence_score < _CONFIDENCE_THRESHOLD:
             missing = get_missing_required_fields(invoice)
 
