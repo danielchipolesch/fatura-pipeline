@@ -138,6 +138,8 @@ Campos disponíveis para preenchimento:
 - subtotal: number
 - payment_method: string
 - line_items: lista de {{"description": string, "quantity": number, "unit": string, "unit_price": number, "total": number}}
+  Se line_items já contém itens com sub-campos null, retorne a lista completa com os sub-campos preenchidos.
+  Inclua apenas itens identificados no texto — não invente itens.
 
 Texto da fatura (até 6000 caracteres):
 ---
@@ -499,7 +501,12 @@ def _get_enrichable_null_fields(invoice: Invoice) -> list[str]:
         null.append("total")
     if invoice.subtotal is None:
         null.append("subtotal")
-    if not invoice.line_items:
+    # line_items: inclui se lista vazia OU se algum item ainda tem quantity e total null
+    # (itens com dados parciais precisam de enriquecimento de sub-campos)
+    if not invoice.line_items or any(
+        item.quantity is None and item.total is None
+        for item in invoice.line_items
+    ):
         null.append("line_items")
     return null
 
@@ -610,18 +617,42 @@ def _merge(invoice: Invoice, data: dict) -> Invoice:
     if not invoice.customer.address.state and data.get("customer_state"):
         invoice.customer.address.state = str(data["customer_state"])
 
-    # Itens de fatura — substitui se o parser determinístico só encontrou itens
-    # sem nenhum dado quantitativo (sinal de lixo de OCR), ou complementa se vazio
-    if invoice.line_items and isinstance(data.get("line_items"), list) and data["line_items"]:
+    # Itens de fatura: três estratégias em ordem de preferência
+    llm_items_raw = data.get("line_items") if isinstance(data.get("line_items"), list) else []
+
+    if invoice.line_items and llm_items_raw:
         all_empty = all(
             item.quantity is None and item.unit_price is None and item.total is None
             for item in invoice.line_items
         )
         if all_empty:
-            invoice.line_items = []  # descarta lixo de OCR para dar lugar ao LLM
+            # Estratégia A: todos os itens existentes são OCR vazio — substituição completa
+            invoice.line_items = []
+        else:
+            # Estratégia B: itens existentes têm dados parciais — merge por descrição.
+            # Preenche sub-campos null (unit, quantity, unit_price, total) nos itens
+            # existentes cujas descrições coincidam com os itens retornados pelo LLM.
+            llm_by_desc = {
+                str(r.get("description", "")).strip().lower(): r
+                for r in llm_items_raw
+                if isinstance(r, dict) and r.get("description")
+            }
+            for item in invoice.line_items:
+                match = llm_by_desc.get(item.description.strip().lower())
+                if not match:
+                    continue
+                if item.unit is None and match.get("unit"):
+                    item.unit = str(match["unit"])[:20]
+                if item.quantity is None and match.get("quantity") is not None:
+                    item.quantity = _as_float(match["quantity"])
+                if item.unit_price is None and match.get("unit_price") is not None:
+                    item.unit_price = _as_float(match["unit_price"])
+                if item.total is None and match.get("total") is not None:
+                    item.total = _as_float(match["total"])
 
-    if not invoice.line_items and isinstance(data.get("line_items"), list):
-        for raw_item in data["line_items"][:10]:
+    # Estratégia C: lista vazia (após descarte de lixo ou sem itens) — popula do LLM
+    if not invoice.line_items and llm_items_raw:
+        for raw_item in llm_items_raw[:10]:
             if not isinstance(raw_item, dict) or not raw_item.get("description"):
                 continue
             invoice.line_items.append(
