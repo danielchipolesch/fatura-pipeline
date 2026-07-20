@@ -525,6 +525,155 @@ def _extract_line_items_from_text(text: str, layout: InvoiceLayout) -> list[Line
 
 
 # ---------------------------------------------------------------------------
+# Extrator NF3e Enel: seções de descrição e valor separadas no texto
+# ---------------------------------------------------------------------------
+
+def _extract_enel_nf3e_items_from_text(text: str) -> list[LineItem]:
+    """
+    Extrai itens de NF3e Enel onde o Docling não detecta tabelas.
+
+    Estrutura do texto linearizado:
+      "Itens de fatura" / "Itens da fatura"  ← header
+      <descrição com unidade embutida>  (ex: "Demanda Ativa kW HFP/Único")
+      ...
+      "TOTAL"  ← encerra a seção de descrições
+
+      "Valor (R$)"  ← header de valores
+      74.088,38 / 367.429,28 / ...  (na mesma ordem das descrições)
+
+      "Quant."  ← em seção de medição
+      1.967 / 516.096 / 40.541  (apenas itens de energia/demanda, ponto=milhar)
+
+      "Preço unit (R$)"  ← cabeçalho (linha seguinte pode ser "Com tributos")
+      37,66567600 / 0,71193982 / ...  (ordem igual aos itens de energia/demanda)
+    """
+    lines = text.splitlines()
+
+    # 1. Localiza "Itens d[ae] fatura"
+    itens_start: int | None = None
+    for i, ln in enumerate(lines):
+        if re.search(r"Itens\s+d[ae]\s+fatura", ln, re.IGNORECASE):
+            itens_start = i
+            break
+    if itens_start is None:
+        return []
+
+    # 2. Coleta descrições até "TOTAL" (ou linha puramente numérica)
+    raw_descs: list[tuple[str, float | None]] = []  # (texto, valor_inline_ou_None)
+    for i in range(itens_start + 1, min(itens_start + 60, len(lines))):
+        ln = lines[i].strip()
+        if not ln:
+            continue
+        if re.match(r"^TOTAL\b", ln, re.IGNORECASE):
+            break
+        if re.match(r"^-?[\d.,]+$", ln):
+            break
+        # Valor inline no fim da linha (ex: "Bandeira Amarela 14.626,61")
+        m_inline = re.search(r"\s+((?:\d{1,3}\.){0,3}\d{1,3},\d+)\s*$", ln)
+        if m_inline:
+            v = parse_currency(m_inline.group(1))
+            if v is not None:
+                raw_descs.append((ln[:m_inline.start()].strip(), v))
+                continue
+        raw_descs.append((ln, None))
+
+    if not raw_descs:
+        return []
+
+    # 3. Coleta valores da seção "Valor (R$)"
+    ext_values: list[float] = []
+    for i, ln in enumerate(lines):
+        if re.match(r"^Valor\s*\(R\$\)\s*$", ln.strip(), re.IGNORECASE):
+            for j in range(i + 1, min(i + 30, len(lines))):
+                vl = lines[j].strip()
+                if not vl:
+                    continue
+                if re.search(r"[A-Za-z]", vl):
+                    break
+                v = parse_currency(vl)
+                if v is not None:
+                    ext_values.append(v)
+                elif ext_values:
+                    break
+            break
+
+    # 4. Coleta quantidades (seção "Quant.") — ponto como separador de milhar
+    quantities: list[float] = []
+    for i, ln in enumerate(lines):
+        if re.match(r"^Quant\.\s*$", ln.strip(), re.IGNORECASE):
+            for j in range(i + 1, min(i + 15, len(lines))):
+                ql = lines[j].strip()
+                if not ql:
+                    continue
+                if re.search(r"[A-Za-z]", ql):
+                    break
+                # "1.967" → 1967, "516.096" → 516096 (ponto=milhar, sem vírgula)
+                if re.match(r"^\d{1,3}(\.\d{3})+$", ql):
+                    quantities.append(float(ql.replace(".", "")))
+                else:
+                    q = parse_currency(ql)
+                    if q is not None:
+                        quantities.append(q)
+                    elif quantities:
+                        break
+            break
+
+    # 5. Coleta preços unitários (seção "Preço unit (R$)")
+    unit_prices: list[float] = []
+    for i, ln in enumerate(lines):
+        if re.search(r"Preço\s+unit", ln.strip(), re.IGNORECASE):
+            for j in range(i + 1, min(i + 12, len(lines))):
+                pl = lines[j].strip()
+                if not pl:
+                    continue
+                if re.search(r"[A-Za-z]", pl):
+                    continue  # pula sub-cabeçalho "Com tributos"
+                p = parse_currency(pl)
+                if p is not None:
+                    unit_prices.append(p)
+                elif unit_prices:
+                    break
+            break
+
+    # 6. Monta LineItems pareando descrições ↔ valores
+    items: list[LineItem] = []
+    val_idx = 0
+    qty_idx = 0
+
+    for desc_text, inline_val in raw_descs:
+        unit_m = re.search(r"\b(kWh|kW|kVARh|kVAR|MWh|MW)\b", desc_text, re.IGNORECASE)
+        unit = unit_m.group(1) if unit_m else None
+
+        total: float | None
+        if inline_val is not None:
+            total = inline_val
+        elif val_idx < len(ext_values):
+            total = ext_values[val_idx]
+            val_idx += 1
+        else:
+            total = None
+
+        qty: float | None = None
+        unit_price: float | None = None
+        if unit is not None and qty_idx < len(quantities):
+            qty = quantities[qty_idx]
+            if qty_idx < len(unit_prices):
+                unit_price = unit_prices[qty_idx]
+            qty_idx += 1
+
+        if desc_text:
+            items.append(LineItem(
+                description=desc_text,
+                unit=unit,
+                quantity=qty,
+                unit_price=unit_price,
+                total=total,
+            ))
+
+    return items
+
+
+# ---------------------------------------------------------------------------
 # Fallback textual: extração de itens de NF-e de energia sem tabela Docling
 # ---------------------------------------------------------------------------
 
@@ -1172,9 +1321,15 @@ class DeterministicParser:
         # tenta extrair itens de energia do texto plano. Só ativa se line_items
         # ainda estiver vazio OU se não houver nenhum item com quantidade kWh/MWh.
         if not line_items:
-            energy_items = _extract_energy_items_from_text(text)
-            if energy_items:
-                line_items = energy_items
+            # Formato NF3e Enel: descrições e valores em seções separadas —
+            # detectado pela presença de "Itens d[ae] fatura" no texto.
+            nf3e_items = _extract_enel_nf3e_items_from_text(text)
+            if nf3e_items:
+                line_items = nf3e_items
+            else:
+                energy_items = _extract_energy_items_from_text(text)
+                if energy_items:
+                    line_items = energy_items
         else:
             # line_items tem dados, mas pode ter vindo de NF-e de comercializadora
             # onde só o cabeçalho ficou (sem linha de produto). Testa se algum
@@ -1182,9 +1337,13 @@ class DeterministicParser:
             # fallback de energia.
             has_qty = any(isinstance(i.quantity, (int, float)) for i in line_items)
             if not has_qty:
-                energy_items = _extract_energy_items_from_text(text)
-                if energy_items:
-                    line_items = energy_items
+                nf3e_items = _extract_enel_nf3e_items_from_text(text)
+                if nf3e_items:
+                    line_items = nf3e_items
+                else:
+                    energy_items = _extract_energy_items_from_text(text)
+                    if energy_items:
+                        line_items = energy_items
 
         # NF-e: itens com código NCM vêm do DANFE (fonte prioritária).
         # Itens sem código vêm de tabelas demonstrativas de componentes
