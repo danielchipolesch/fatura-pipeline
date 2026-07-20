@@ -6,7 +6,7 @@ Pipeline de extração estruturada de faturas e notas fiscais em PDF, com foco e
 
 ## Visão Geral
 
-O pipeline converte PDFs de documentos fiscais em objetos JSON padronizados, prontos para ingestão em sistemas de BI, ERP ou data warehouse. A extração é feita em três camadas progressivas, preferindo sempre a interpretação semântica e degradando graciosamente para regex e LLM quando necessário.
+O pipeline converte PDFs de documentos fiscais em objetos JSON padronizados, prontos para ingestão em sistemas de BI, ERP ou data warehouse. A extração é feita em três camadas progressivas, com enriquecimento automático via LLM local (Ollama) para maximizar a cobertura de campos.
 
 **Tipos de documento suportados**
 
@@ -23,7 +23,7 @@ O pipeline converte PDFs de documentos fiscais em objetos JSON padronizados, pro
 
 ## Arquitetura
 
-### Pipeline de três camadas
+### Pipeline de extração
 
 ```
 PDF
@@ -41,23 +41,25 @@ PDF
 │  Padrões indexados por layout,           │
 │  score de confiança por cobertura        │
 └──────────────────┬──────────────────────┘
-                   │ confiança < threshold
+                   │ sempre (modo enriquecimento)
                    ▼
 ┌─────────────────────────────────────────┐
 │  Camada 3 — LLMFallback (Ollama)         │
-│  qwen2.5:3b (Apache 2.0), ativado        │
-│  apenas quando necessário                │
+│  JSON parcial + texto → preenche         │
+│  apenas os campos ainda null             │
 └─────────────────────────────────────────┘
                    │
                    ▼
-            invoice.json
+         output/json/<nome>.json
+         output/xlsx/faturas.xlsx
+         output/csv/faturas.csv
 ```
 
 **DoclingExtractor** extrai via estrutura nativa do Docling (seções, pares chave-valor, bounding boxes e tabelas). Para impostos, aplica detecção matemática de triplas (base × alíquota/100 ≈ valor), resistindo a layouts onde os valores aparecem antes do label no texto linearizado (DANFE NF3E, por exemplo).
 
 **DeterministicParser** cobre o que o Docling não encontrou com expressões regulares por layout, incluindo identificadores brasileiros (CNPJ, CPF, CEP, chave de acesso), datas em formatos variados e métricas de energia.
 
-**LLMFallback** processa o documento completo via Ollama quando o score de confiança fica abaixo do limiar configurado, ou quando OCR é detectado (documentos digitalizados têm confiança forçada a 0).
+**LLMFallback** roda após a extração determinística via Ollama local (sem dependência de APIs externas). No modo padrão (`LLM_ENRICH_MODE=always`), recebe o JSON parcial já extraído — com campos preenchidos visíveis e campos null explícitos — e preenche apenas o que estiver faltando, sem sobrescrever resultados já obtidos. Para documentos digitalizados (OCR), a confiança é forçada a 0 e todos os campos essenciais são reprocessados.
 
 ### Classificação de layout
 
@@ -82,9 +84,9 @@ NFe (DANFE, CFOP) > NFSe (Tomador, ISS) > Boleto > Energia (kWh, tarifa) > Gené
 fatura-pipeline/
 ├── src/
 │   ├── main.py                  # Entrypoint + CLI (batch / watch / arquivo único)
-│   ├── pipeline.py              # Orquestrador das três camadas
+│   ├── pipeline.py              # Orquestrador das camadas de extração
 │   ├── models/
-│   │   └── invoice.py           # Modelos Pydantic: Invoice, Tax, LineItem, EnergyMetrics…
+│   │   └── invoice.py           # Modelos Pydantic: Invoice, Tax, LineItem…
 │   ├── extractors/
 │   │   ├── docling_extractor.py # Camada 1 — extração semântica
 │   │   ├── fields.py            # Funções puras de extração de campos (regex)
@@ -98,10 +100,14 @@ fatura-pipeline/
 │   │   ├── deterministic.py     # Camada 2 — parsing por regex e layout
 │   │   └── llm_fallback.py      # Camada 3 — enriquecimento via Ollama
 │   └── utils/
+│       ├── exporters.py         # Geração de XLSX e CSV acumulativos
 │       └── helpers.py           # SHA-256, serialização JSON, registro de idempotência
 ├── scripts/                     # Scripts utilitários de debug
 ├── input/                       # PDFs de entrada (gitignore, montado no Docker)
-├── output/                      # JSONs gerados + .processed_registry.json
+├── output/
+│   ├── json/                    # JSON individual por fatura
+│   ├── xlsx/                    # faturas.xlsx — planilha acumulativa
+│   └── csv/                     # faturas.csv — CSV acumulativo (UTF-8 BOM)
 ├── logs/                        # pipeline.log (rotativo)
 ├── Dockerfile
 ├── docker-compose.yml
@@ -163,13 +169,14 @@ O pipeline é idempotente: arquivos já processados (SHA-256 registrado em `.pro
 | Variável | Padrão | Descrição |
 |----------|--------|-----------|
 | `INPUT_DIR` | `/app/input` | Diretório de entrada dos PDFs |
-| `OUTPUT_DIR` | `/app/output` | Diretório de saída dos JSONs |
+| `OUTPUT_DIR` | `/app/output` | Diretório raiz de saída (`json/`, `xlsx/`, `csv/` criados automaticamente) |
 | `LOGS_DIR` | `/app/logs` | Diretório de logs |
-| `LOG_LEVEL` | `INFO` | Nível de log (DEBUG, INFO, WARNING, ERROR) |
+| `LOG_LEVEL` | `INFO` | Nível de log (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 | `WATCH_MODE` | `false` | Ativar modo de monitoramento contínuo |
-| `POLL_INTERVAL_SECONDS` | `30` | Intervalo do modo watch |
-| `CONFIDENCE_THRESHOLD` | `0.60` | Score mínimo antes de acionar o LLM |
-| `LLM_FALLBACK_ENABLED` | `false` | Habilitar fallback via Ollama |
+| `POLL_INTERVAL_SECONDS` | `30` | Intervalo do modo watch (segundos) |
+| `CONFIDENCE_THRESHOLD` | `0.60` | Score mínimo de confiança; abaixo disso o LLM roda como segunda passagem |
+| `LLM_FALLBACK_ENABLED` | `true` | Habilitar enriquecimento via Ollama |
+| `LLM_ENRICH_MODE` | `always` | Modo de acionamento do LLM: `always` (enriquecimento pós-extração, padrão) ou `threshold` (só abaixo do limiar de confiança) |
 | `LLM_MODEL` | `qwen2.5:3b` | Modelo Ollama a usar |
 | `LLM_BASE_URL` | `http://ollama:11434` | URL do serviço Ollama |
 | `DOCLING_OCR_MODE` | `auto` | Modo OCR: `auto` / `always` / `never` |
@@ -294,13 +301,19 @@ pip install -r requirements.txt
 INPUT_DIR=./input OUTPUT_DIR=./output python -m src.main fatura.pdf
 ```
 
-Para ativar o fallback LLM localmente, suba o Ollama separadamente:
+Para usar o enriquecimento LLM localmente, suba o Ollama separadamente:
 
 ```bash
 ollama serve
 ollama pull qwen2.5:3b
 
 LLM_FALLBACK_ENABLED=true LLM_BASE_URL=http://localhost:11434 python -m src.main fatura.pdf
+```
+
+O modo padrão (`LLM_ENRICH_MODE=always`) envia o JSON parcial já extraído ao LLM, que preenche apenas os campos null — sem reprocessar o documento inteiro. Para o comportamento original (LLM só ativa abaixo do limiar de confiança):
+
+```bash
+LLM_ENRICH_MODE=threshold LLM_FALLBACK_ENABLED=true LLM_BASE_URL=http://localhost:11434 python -m src.main fatura.pdf
 ```
 
 ---
