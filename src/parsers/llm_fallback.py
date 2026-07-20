@@ -501,12 +501,19 @@ def _get_enrichable_null_fields(invoice: Invoice) -> list[str]:
         null.append("total")
     if invoice.subtotal is None:
         null.append("subtotal")
-    # line_items: inclui se lista vazia OU se algum item ainda tem quantity e total null
-    # (itens com dados parciais precisam de enriquecimento de sub-campos)
-    if not invoice.line_items or any(
-        item.quantity is None and item.total is None
-        for item in invoice.line_items
-    ):
+    # line_items: inclui se:
+    #   - lista vazia
+    #   - algum item tem quantity e total null (sem dados numéricos)
+    #   - algum item com dados numéricos ainda tem unit null (unidade de medida ausente)
+    def _item_needs_enrichment(item) -> bool:
+        if item.quantity is None and item.total is None:
+            return True
+        has_data = item.quantity is not None or item.total is not None
+        if has_data and item.unit is None:
+            return True
+        return False
+
+    if not invoice.line_items or any(_item_needs_enrichment(i) for i in invoice.line_items):
         null.append("line_items")
     return null
 

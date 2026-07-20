@@ -819,12 +819,25 @@ def extract_energy_quantity_mwh(text: str) -> float | None:
             return v
 
     # Padrão 2: linha com unidade MWh próxima a um número
+    # Ignora valores no formato X.XXX (ex: "5.251 MWH") que são códigos CFOP.
     m = re.search(
         r"([\d.,]+)\s*\n?\s*MW\s*h?\b",
         text, re.IGNORECASE,
     )
     if m:
-        v = parse_currency(m.group(1))
+        raw = m.group(1)
+        if not re.match(r"^\d\.\d{3}$", raw):  # exclui CFOPs como 5.251
+            v = parse_currency(raw)
+            if v is not None and 0.001 < v < 99999:
+                return v
+
+    # Padrão 3: CFOP + UN fundidos ("5.251 MWH\n<qtde>") — DANFE NF-e linearizado
+    m3 = re.search(
+        r"^\d\.\d{3}\s+MWh?\s*$\s*([\d.,]+)",
+        text, re.IGNORECASE | re.MULTILINE,
+    )
+    if m3:
+        v = parse_currency(m3.group(1))
         if v is not None and 0.001 < v < 99999:
             return v
 

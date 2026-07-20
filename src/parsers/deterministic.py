@@ -886,6 +886,10 @@ def _extract_energy_items_from_text(text: str) -> list[LineItem]:
             inline_nums = [parse_currency(n) for n in inline_nums if parse_currency(n) is not None]
 
             # Lê até 6 linhas seguintes (formato vertical)
+            # No DANFE NF-e linearizado, antes dos valores numéricos aparecem campos
+            # de código: NCM (8 dígitos), CST (2-3 dígitos), CFOP+UN fundidos ("5.251 MWH").
+            # Ignoramos esses campos até que a unidade seja confirmada.
+            _unit_confirmed = False
             for j in range(i + 1, min(i + 7, len(lines))):
                 l = lines[j].strip()
                 if not l:
@@ -893,10 +897,26 @@ def _extract_energy_items_from_text(text: str) -> list[LineItem]:
                 if re.match(r"^[A-ZÀ-Ú]{4,}(\s+[A-ZÀ-Ú]+){0,3}$", l):
                     if not re.match(r"^[Kk][Ww]|^[Mm][Ww]", l):
                         break
+                # Unidade isolada (ex: "kWh", "MWH", "kW")
                 if re.match(r"^[Kk][Ww][Hh]$|^[Mm][Ww][Hh]?$|^[Kk][Ww]$|^[Kk][Vv][Aa][Rr][Hh]?$",
                             l, re.IGNORECASE):
                     unit = l.upper()
+                    _unit_confirmed = True
                     continue
+                # CFOP + UN fundidos em uma linha (ex: "5.251 MWH")
+                _cfop_un = re.match(r"^\d\.\d{3}\s+(\S+)$", l)
+                if _cfop_un:
+                    _ustr = _cfop_un.group(1).upper()
+                    if re.match(r"^(MWH?|KWH?|KW|KVARH?)$", _ustr):
+                        unit = _ustr
+                        _unit_confirmed = True
+                    continue  # sempre pula CFOP para extração numérica
+                # Antes de confirmar a unidade, pula códigos NCM (8 dígitos) e CST (2-3 dígitos)
+                if not _unit_confirmed:
+                    if re.match(r"^\d{8}$", l):   # NCM
+                        continue
+                    if re.match(r"^\d{2,3}$", l):  # CST
+                        continue
                 n = parse_currency(l)
                 if n is None:
                     continue
@@ -928,11 +948,16 @@ def _extract_energy_items_from_text(text: str) -> list[LineItem]:
             if canonical_unit == "MWh" and isinstance(qty, float) and qty > 99_999:
                 qty = None
 
-            # "Energia Elétrica" só é criada se a unidade MWh foi confirmada
-            # (inline "(MWh)" ou linha seguinte) — evita falsos positivos em
-            # cabeçalhos de tabela de contas de concessionária.
+            # "Energia Elétrica" só é criada se a unidade MWh foi confirmada —
+            # evita falsos positivos em cabeçalhos de tabela de contas de concessionária.
+            # Verifica a linha de descrição E as linhas vizinhas (para DANFE linearizado
+            # onde "MWH" aparece na linha CFOP+UN fundida, não na descrição).
             if canonical_desc == "Energia Elétrica":
-                mwh_confirmed = bool(re.search(r"\bMWh?\b", line, re.IGNORECASE)) or unit == "MWH"
+                _window = "\n".join(lines[i:min(i + 7, len(lines))])
+                mwh_confirmed = (
+                    bool(re.search(r"\bMWh?\b", _window, re.IGNORECASE))
+                    or unit in ("MWH", "MWh")
+                )
                 if not mwh_confirmed:
                     continue
 

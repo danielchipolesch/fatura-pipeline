@@ -20,6 +20,16 @@ _price_aliases = {"unit", "pre", "price", "valor unit"}
 _total_aliases = {"total", "valor total", "vlr total", "subtotal"}
 _code_aliases  = {"cod", "código", "codigo", "ref", "ncm", "cfop"}
 
+# Mapeamento de unidades por descrição — usado quando a coluna UN não é extraída pelo Docling.
+# As unidades são fixadas por norma ANEEL: energia ativa em kWh, demanda em kW.
+_UNIT_BY_DESC_FRAGMENT: list[tuple[str, str]] = [
+    ("energia ativa",   "kWh"),
+    ("energia reativa", "kVARh"),
+    ("demanda reativa", "kVAR"),
+    ("demanda ativa",   "kW"),
+    ("demanda",         "kW"),
+]
+
 # Linhas que são cabeçalhos residuais ou metadados de histórico de leitura —
 # não representam itens de cobrança.
 _NOISE_ROW = re.compile(
@@ -95,6 +105,20 @@ def extract_line_items_from_tables(tables: List[pd.DataFrame]) -> List[LineItem]
         # Coluna de código do produto (separada da descrição)
         code_col  = next((c for c in cols if _col_match(c, _code_aliases) and c != desc_col), None)
 
+        # Detecta deslocamento de coluna DANFE: o Docling às vezes remove o cabeçalho
+        # da coluna UN (unidade), mantendo a coluna com valor mas sem header. Isso empurra
+        # os dados uma coluna para a esquerda — a coluna em branco entre CFOP e QTD tem
+        # a quantidade real, e a coluna QTD passa a ter o valor unitário.
+        _danfe_shift_col = None
+        _cfop_idx = next((i for i, c in enumerate(cols) if "cfop" in str(c).lower()), None)
+        if _cfop_idx is not None and qty_col is not None:
+            _qty_idx = cols.index(qty_col)
+            for _ci in range(_cfop_idx + 1, _qty_idx):
+                _cn = str(cols[_ci]).strip()
+                if not _cn or _cn.lower() in ("nan", "none", ""):
+                    _danfe_shift_col = cols[_ci]
+                    break
+
         for _, row in df.iterrows():
             desc_val = str(row.get(desc_col, "")).strip()
             if not desc_val or desc_val.lower() in ("nan", "none", ""):
@@ -124,7 +148,17 @@ def extract_line_items_from_tables(tables: List[pd.DataFrame]) -> List[LineItem]
                         code_col = desc_col
 
             qty = None
-            if qty_col and str(row.get(qty_col, "")).strip():
+            _danfe_shifted = False
+            # DANFE shift: coluna em branco entre CFOP e QTD tem a quantidade real
+            if _danfe_shift_col is not None:
+                _bv = str(row.get(_danfe_shift_col, "")).strip()
+                if _bv and _bv.lower() not in ("nan", "none"):
+                    _bc = parse_currency(_bv)
+                    if _bc is not None and _bc > 1:
+                        qty = _bc
+                        _danfe_shifted = True
+
+            if qty is None and qty_col and str(row.get(qty_col, "")).strip():
                 try:
                     qty = parse_currency(str(row[qty_col]))
                 except Exception:
@@ -152,8 +186,20 @@ def extract_line_items_from_tables(tables: List[pd.DataFrame]) -> List[LineItem]
             unit_val_str = str(row.get(un_col, "")).strip() if un_col else ""
             unit = unit_val_str if unit_val_str and unit_val_str.lower() not in ("nan", "none") else None
 
+            # Inferência de unidade por descrição quando a coluna UN não foi extraída.
+            if unit is None:
+                desc_lower = desc_val.lower()
+                for _frag, _inferred in _UNIT_BY_DESC_FRAGMENT:
+                    if _frag in desc_lower:
+                        unit = _inferred
+                        break
+
             unit_price = None
-            if price_col and str(row.get(price_col, "")).strip():
+            if _danfe_shifted:
+                # No deslocamento DANFE, a coluna QTD tem o valor unitário real
+                if qty_col and str(row.get(qty_col, "")).strip():
+                    unit_price = parse_currency(str(row[qty_col]))
+            elif price_col and str(row.get(price_col, "")).strip():
                 unit_price = parse_currency(str(row[price_col]))
 
             total_val = None
