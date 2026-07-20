@@ -549,6 +549,16 @@ def extract_consumer_unit(text: str) -> Optional[str]:
     if m:
         return m.group(1)
 
+    # DANFE de 2 colunas (ex: CEMIG): "INSTALAÇÃO:\n<período>\n<código>"
+    # O Docling lineariza como header1→header2→val1→val2; a instalação fica
+    # 2 linhas abaixo do seu label quando há outra coluna (ex: TIPO) intercalada.
+    m = re.search(
+        r"INSTALA[ÇC][ÃA]O\s*:?\s*\n[^\n]{0,30}\n\s*(\d{6,})",
+        text, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+
     m = re.search(
         r"UNID(?:ADE)?\.?\s*CONSUMIDORA\s*[:\s]*\n?\s*(\d{4,})",
         text, re.IGNORECASE,

@@ -312,6 +312,9 @@ class _FieldExtractor:
             r"VALOR\s+TOTAL\s+(?:DA\s+)?(?:NOTA|NF)",
             r"Total\s+(?:da\s+)?Nota",
             r"VALOR\s+DO\s+DOCUMENTO",
+            # DANFE multi-página: "Total a pagar R$ 73.985,43" aparece numa só linha
+            # no cabeçalho da fatura e no DANFE (prioriza valor líquido a pagar).
+            r"Total\s+a\s+pagar",
             r"\bTOTAL\b",
         ],
         InvoiceLayout.NFSE: [
@@ -350,7 +353,9 @@ class _FieldExtractor:
         labels = cls._TOTAL_LABELS_BY_LAYOUT.get(layout, cls._TOTAL_LABELS_BY_LAYOUT[InvoiceLayout.GENERIC])
         label_matched_unparseable = False
         for label in labels:
-            val = extract_labeled_value(text, label, r"R?\$?\s*[\d.,\-]+")
+            # Requer ao menos um dígito no valor para evitar capturar sinais
+            # de pontuação como "." em frases como "RECEBER SOMENTE PELO VALOR TOTAL."
+            val = extract_labeled_value(text, label, r"R?\$?\s*\d[\d.,]*")
             if val:
                 v = parse_currency(val)
                 if v is not None and v > 0:
@@ -1180,6 +1185,14 @@ class DeterministicParser:
                 energy_items = _extract_energy_items_from_text(text)
                 if energy_items:
                     line_items = energy_items
+
+        # NF-e: itens com código NCM vêm do DANFE (fonte prioritária).
+        # Itens sem código vêm de tabelas demonstrativas de componentes
+        # tarifários — descartados quando o DANFE já forneceu itens.
+        if layout == InvoiceLayout.NFE and line_items:
+            coded = [i for i in line_items if i.code]
+            if coded:
+                line_items = coded
 
         # -- Série (NF-e) --
         series = None

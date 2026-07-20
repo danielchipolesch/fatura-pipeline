@@ -385,6 +385,8 @@ class DoclingExtractor:
                 r"UNID(?:ADE)?\.?\s*CONSUMIDORA",
                 r"C[ÓO]D(?:IGO)?\.?\s*INSTALA[ÇC][ÃA]O",
                 r"N[ºo°]\.?\s*(?:DA\s+)?INSTALA[ÇC][ÃA]O",
+                # Label "INSTALAÇÃO:" bare (ex: DANFE CEMIG sem prefixo "Nº DA")
+                r"INSTALA[ÇC][ÃA]O\b",
             ]
             _DATE_RE = re.compile(r"\d{2}[/\-]\d{2}[/\-]\d{4}")
             for label_pattern in uc_labels:
