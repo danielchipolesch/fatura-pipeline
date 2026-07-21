@@ -519,6 +519,36 @@ def strip_label_prefix(name: str, label_patterns: list[str]) -> str:
 # Métricas de energia elétrica (BI) — extração direta, nunca calculada
 # ---------------------------------------------------------------------------
 
+# Valores inválidos de UC: placeholders, códigos tarifários e zeros
+_INVALID_UC_RE = re.compile(
+    r"^(?:não\s+informado|n\.?\s*[/.]?\s*a\.?|não\s+consta|indisponível|"
+    r"sem\s+inform|n\.?\s*d\.?)$",
+    re.IGNORECASE,
+)
+_UC_TARIFF_CLASS_RE = re.compile(r"^[A-Z]\d{1,2}$")  # ex: "A4", "B1", "B2"
+
+
+def _clean_uc(val: str) -> Optional[str]:
+    """Valida e limpa código de UC extraído; retorna None se inválido."""
+    val = val.strip()
+    if not val:
+        return None
+    if _INVALID_UC_RE.match(val):
+        return None
+    if _UC_TARIFF_CLASS_RE.match(val):
+        return None
+    if re.match(r"^0+$", val):
+        return None
+    digits = re.sub(r"[^\d]", "", val)
+    if len(digits) < 4 or len(val) < 3:
+        return None
+    # Campo combinado "UC / N° cliente" (ex: Enel Ceará: "1215915 / 13170963")
+    slash_m = re.match(r"(\d{4,})\s*/\s*\d{4,}", val)
+    if slash_m:
+        return slash_m.group(1)
+    return val
+
+
 def extract_consumer_unit(text: str) -> Optional[str]:
     """
     Extrai o código da Unidade Consumidora (UC) — identifica o ponto de
@@ -529,10 +559,13 @@ def extract_consumer_unit(text: str) -> Optional[str]:
       2. "Nº DO CLIENTE ... Nº DA INSTALAÇÃO <cliente> <instalação>" (CEMIG)
          — captura especificamente o valor da INSTALAÇÃO, não do cliente
       3. "INSTALAÇÃO <código>" ou "UNID. CONSUMIDORA <código>" isolados
+      4. Código MTE barefoot (ex: Enel SP — "MTE0001725" isolado na linha)
     """
-    m = re.search(r"\bUC\s+([\d][\d.\-]*)", text)
+    m = re.search(r"\bUC\s+([\w][\w.\-]*)", text)
     if m:
-        return m.group(1).strip()
+        val = _clean_uc(m.group(1))
+        if val:
+            return val
 
     m = re.search(
         r"N[ºo°]\s*D[OA]\s*CLIENTE\s*\n?\s*N[ºo°]?\s*\n?\s*DA\s*\n?\s*"
@@ -540,14 +573,18 @@ def extract_consumer_unit(text: str) -> Optional[str]:
         text, re.IGNORECASE,
     )
     if m:
-        return m.group(1)
+        val = _clean_uc(m.group(1))
+        if val:
+            return val
 
     m = re.search(
         r"(?:N[ºo°]\s*(?:DA\s*)?)?INSTALA[ÇC][ÃA]O\s*[:\s]*\n?\s*(\d{4,})",
         text, re.IGNORECASE,
     )
     if m:
-        return m.group(1)
+        val = _clean_uc(m.group(1))
+        if val:
+            return val
 
     # DANFE de 2 colunas (ex: CEMIG): "INSTALAÇÃO:\n<período>\n<código>"
     # O Docling lineariza como header1→header2→val1→val2; a instalação fica
@@ -557,14 +594,78 @@ def extract_consumer_unit(text: str) -> Optional[str]:
         text, re.IGNORECASE,
     )
     if m:
-        return m.group(1)
+        val = _clean_uc(m.group(1))
+        if val:
+            return val
+
+    # DANF3E Enel/RGE: "INSTALAÇÃO/UNID. CONSUMIDORA" com até 5 linhas intermediárias
+    # (Docling lineariza colunas adjacentes entre label e valor)
+    m = re.search(
+        r"INSTALA[ÇC][ÃA]O(?:\s*/\s*UNID\.?\s*CONSUMIDORA)?\s*[:\s]*\n"
+        r"(?:[^\n]*\n){0,5}?(\d{4,})\b",
+        text, re.IGNORECASE,
+    )
+    if m:
+        val = _clean_uc(m.group(1))
+        if val:
+            return val
 
     m = re.search(
         r"UNID(?:ADE)?\.?\s*CONSUMIDORA\s*[:\s]*\n?\s*(\d{4,})",
         text, re.IGNORECASE,
     )
     if m:
+        val = _clean_uc(m.group(1))
+        if val:
+            return val
+
+    # Enel SP: código MTE isolado em linha própria (ex: "MTE0001725")
+    # Aparece no bloco de cabeçalho próximo aos dados do cliente
+    m = re.search(r"^\s*(MTE\d{5,})\s*$", text, re.MULTILINE)
+    if m:
         return m.group(1)
+
+    # Enel Ceará: campo "UC / N° cliente" combinado numa célula
+    # (ex: "1215915 / 13170963" — o primeiro número é a UC, o segundo o cliente)
+    m = re.search(r"(?<!\d)(\d{5,})\s*/\s*\d{5,}(?!\d)", text)
+    if m:
+        val = _clean_uc(m.group(1))
+        if val:
+            return val
+
+    # Light NF3e: UC aparece após tipo de ligação (TRIFÁSICO/BIFÁSICO) sem label explícito
+    # Estrutura: "TRIFÁSICO\n<UC 7-10 dígitos>\n<endereço>"
+    m = re.search(
+        r"(?:TRIFÁSICO|BIFÁSICO|MONOFÁSICO)\s*\n\s*(\d{7,10})\b",
+        text, re.IGNORECASE,
+    )
+    if m:
+        val = _clean_uc(m.group(1))
+        if val:
+            return val
+
+    # RGE SUL DANF3E: UC aparece entre datas de pagamento e datas de leitura,
+    # seguido de "Próxima leitura"
+    # Estrutura: "<data>\n<UC>\n<data leitura atual>\n<data leitura ant.>\n<dias>\nPróxima leitura"
+    m = re.search(
+        r"(\d{8,12})\n\d{2}/\d{2}/\d{4}\n\d{2}/\d{2}/\d{4}\n\d+\nPróxima leitura",
+        text,
+    )
+    if m:
+        val = _clean_uc(m.group(1))
+        if val:
+            return val
+
+    # Amazonas Energia: "Código Único" ou "Código para débito automático" — identificador da UC
+    m = re.search(
+        r"Código\s+(?:[Úu]nico|para\s+débito\s+automático)\s*[:\s]+(\d[\d-]+)",
+        text, re.IGNORECASE,
+    )
+    if m:
+        raw = m.group(1).replace("-", "")  # remove check digit separator "0872410-5" → "08724105"
+        val = _clean_uc(raw)
+        if val:
+            return val
 
     return None
 

@@ -21,6 +21,7 @@ from typing import Optional
 from loguru import logger
 
 from src.extractors.fields import (
+    _clean_uc,
     extract_br_state,
     extract_cnpj,
     extract_consumer_unit,
@@ -206,10 +207,9 @@ class DoclingExtractor:
                     state_list.append(v)
 
             if "consumer_unit" not in result and _kv_matches(key_lower, _KV_CONSUMER_UNIT):
-                # Aceita valor que contenha ao menos 4 dígitos (código numérico de UC)
-                import re as _re
-                if value_stripped and len(_re.sub(r"[^\d]", "", value_stripped)) >= 4:
-                    result["consumer_unit"] = value_stripped
+                cleaned = _clean_uc(value_stripped)
+                if cleaned:
+                    result["consumer_unit"] = cleaned
 
         # Heurística de ordem: 1ª ocorrência = supplier, 2ª = customer
         if cnpj_list and "supplier_cnpj" not in result:
@@ -382,25 +382,28 @@ class DoclingExtractor:
         if "consumer_unit" not in result:
             uc_labels = [
                 r"PONTO\s+DE\s+ENTREGA",
+                r"N[ºo°]\s+D[AO]\s+INSTALA[ÇC][ÃA]O",
+                r"INSTALA[ÇC][ÃA]O\s*/\s*UNID\.?\s*CONSUMIDORA",
                 r"UNID(?:ADE)?\.?\s*CONSUMIDORA",
                 r"C[ÓO]D(?:IGO)?\.?\s*INSTALA[ÇC][ÃA]O",
                 r"N[ºo°]\.?\s*(?:DA\s+)?INSTALA[ÇC][ÃA]O",
                 # Label "INSTALAÇÃO:" bare (ex: DANFE CEMIG sem prefixo "Nº DA")
                 r"INSTALA[ÇC][ÃA]O\b",
+                # Etiqueta curta "UC" em células de tabela (ex: Enel Ceará)
+                r"(?<![A-Z])\bUC\b(?![A-Z])",
             ]
             _DATE_RE = re.compile(r"\d{2}[/\-]\d{2}[/\-]\d{4}")
             for label_pattern in uc_labels:
+                # Aceita códigos numéricos e alfanuméricos (ex: MTE0001725)
                 val_text = _spatial_right_or_below(
                     content.spatial_index, label_pattern,
-                    value_pattern=r"[\d][\d.\-/]*",
+                    value_pattern=r"[A-Z0-9][\w.\-/]*",
                 )
-                if (
-                    val_text
-                    and len(re.sub(r"[^\d]", "", val_text)) >= 4
-                    and not _DATE_RE.search(val_text)
-                ):
-                    result["consumer_unit"] = val_text
-                    break
+                if val_text and not _DATE_RE.search(val_text):
+                    cleaned = _clean_uc(val_text)
+                    if cleaned:
+                        result["consumer_unit"] = cleaned
+                        break
 
         # Impostos via âncora espacial — funciona quando labels e valores estão
         # lado a lado no layout (DANFE NF3E, boleto com tabela de ICMS/PIS/COFINS).
